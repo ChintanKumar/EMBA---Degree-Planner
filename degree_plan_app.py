@@ -185,7 +185,7 @@ st.markdown(
     <div class="info-banner">
       <strong>How it works:</strong>
       Use the options on the left to choose your program, start term, pace, and certificates.
-      When you click <em>Generate plan</em>, we’ll build a recommended term-by-term schedule
+      When you click <em>Generate plan</em>, we'll build a recommended term-by-term schedule
       that follows OBCC course offerings and prerequisites. The plan is now generated
       via the OBCC Vertex AI Conversational Agent, which calls the planner tool behind the scenes.
     </div>
@@ -197,7 +197,7 @@ st.markdown(
 
 # Original planner API URL (kept here for reference / fallback if needed)
 PLANNER_API_URL = (
-    "http://localhost:8000/plan"
+    "http://localhost:8001/plan"
     # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
 )
 
@@ -237,33 +237,19 @@ DF_AGENT_PATH = (
 
 
 def _extract_json_from_text(text: str) -> dict:
-    """
-    Try very hard to extract a dict-like object from the agent's text response.
-
-    Strategy:
-      1. Try json.loads on the full text.
-      2. If that fails, look for the longest {...} block and try json.loads on it.
-      3. If that still fails, try ast.literal_eval on both the full text and the block.
-      4. If that still fails, extract each course row object individually and return
-         {"rows": [...]} built from those.
-    """
     text = text.strip()
 
-    # --- 1) direct JSON ---
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # --- 2) extract the biggest {...} block ---
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         candidate = m.group(0).strip()
-        # 2a) try JSON on that
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            # 2b) try Python-style literal (handles single quotes, trailing commas)
             try:
                 obj = ast.literal_eval(candidate)
                 if isinstance(obj, dict):
@@ -271,7 +257,6 @@ def _extract_json_from_text(text: str) -> dict:
             except Exception:
                 pass
 
-    # --- 3) as a last attempt on the whole text with ast.literal_eval ---
     try:
         obj = ast.literal_eval(text)
         if isinstance(obj, dict):
@@ -279,20 +264,15 @@ def _extract_json_from_text(text: str) -> dict:
     except Exception:
         pass
 
-    # --- 4) Fallback: extract each row object separately ---
     rows: list[dict] = []
 
-    # This regex looks for JSON-like objects that contain "course_number"
-    # and no nested braces (good enough for our planner rows).
     for match in re.finditer(r'\{[^{}]*"course_number"[^{}]*\}', text):
         obj_str = match.group(0)
         parsed = None
 
-        # Try JSON first
         try:
             parsed = json.loads(obj_str)
         except json.JSONDecodeError:
-            # Fall back to ast.literal_eval
             try:
                 parsed = ast.literal_eval(obj_str)
             except Exception:
@@ -302,10 +282,8 @@ def _extract_json_from_text(text: str) -> dict:
             rows.append(parsed)
 
     if rows:
-        # We successfully parsed at least one row object
         return {"rows": rows}
 
-    # If everything failed, raise a detailed error so we can debug
     snippet = text[:600] + ("..." if len(text) > 600 else "")
     raise ValueError(
         "Could not parse JSON from agent response. "
@@ -315,13 +293,6 @@ def _extract_json_from_text(text: str) -> dict:
 
 
 def call_planner_via_agent(payload: dict) -> list[dict]:
-    """
-    Call the OBCC Vertex AI Conversational Agent first (for the project
-    requirement), but use the Cloud Run planner API as the source of truth
-    for the final rows so we never lose courses due to LLM truncation.
-    """
-
-    # ---------- 1) Call the conversational agent ----------
     if "df_session_id" not in st.session_state:
         st.session_state["df_session_id"] = str(uuid.uuid4())
     session_id = st.session_state["df_session_id"]
@@ -354,7 +325,6 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
 
         response = client.detect_intent(request=request)
 
-        # Collect agent text
         parts = []
         for msg in response.query_result.response_messages:
             if msg.text and msg.text.text:
@@ -367,20 +337,16 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
                 agent_text = agent_text[:-3].strip()
 
         if agent_text:
-            # Try to parse whatever the agent returned
             try:
                 data = _extract_json_from_text(agent_text)
                 if "rows" in data and isinstance(data["rows"], list):
                     agent_rows = data["rows"]
             except Exception:
-                # Parsing failures are OK – we'll rely on the planner API below
                 agent_rows = []
 
     except Exception:
-        # Agent call failing should not break the app; we'll rely on the planner API.
         agent_rows = []
 
-    # ---------- 2) Call the Cloud Run planner API (source of truth) ----------
     planner_rows: list[dict] = []
     try:
         resp = requests.post(PLANNER_API_URL, json=payload, timeout=60)
@@ -388,23 +354,18 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
         data = resp.json()
         planner_rows = data.get("rows", []) or []
     except Exception as planner_err:
-        # If planner fails, fall back to whatever we got from the agent
         if agent_rows:
             return agent_rows
-        # If neither works, bubble up a clear error
         raise RuntimeError(
             f"Planner API failed after calling the agent: {planner_err}"
         )
 
-    # If the planner returned anything, use it as canonical
     if planner_rows:
         return planner_rows
 
-    # Planner returned nothing but agent did – use agent rows as a last resort
     if agent_rows:
         return agent_rows
 
-    # Nothing at all
     raise ValueError("Both the OBCC agent and planner API returned no rows.")
 
 
@@ -417,10 +378,6 @@ bq_client = bigquery.Client(project=PROJECT_ID)
 
 @st.cache_data(show_spinner=False)
 def load_catalog():
-    """
-    Load simple course + offering catalog from BigQuery for the chatbot.
-    Cached so we don't hit BigQuery on every question.
-    """
     courses_query = f"""
         SELECT
           CourseID,
@@ -444,9 +401,6 @@ def load_catalog():
 
 
 def _normalize_course_number(raw: str) -> str:
-    """
-    Turn 'ob6374', 'OB6374', 'ob 6374' -> 'OB 6374'
-    """
     raw = raw.strip().upper()
     m = re.match(r"^([A-Z]{2,4})\s*([0-9]{4})$", raw)
     if not m:
@@ -459,11 +413,6 @@ def answer_course_question(
     df_courses: pd.DataFrame,
     df_offerings: pd.DataFrame,
 ) -> str:
-    """
-    Very simple Q&A:
-    - Find first thing that looks like a course number (e.g. OB 6374)
-    - Return course title, credits, and which terms/sessions it's offered.
-    """
     match = re.search(r"\b[A-Za-z]{2,4}\s*\d{4}\b", question)
     if not match:
         return (
@@ -477,7 +426,6 @@ def answer_course_question(
     raw_code = match.group(0)
     code = _normalize_course_number(raw_code)
 
-    # Look up course info
     row = df_courses[df_courses["CourseNumber"].str.upper() == code].head(1)
     if row.empty:
         return f"I couldn't find a course with number **{code}** in the catalog."
@@ -487,18 +435,12 @@ def answer_course_question(
     credits = int(row["DefaultCreditHours"])
     course_id = int(row["CourseID"])
 
-    # Look up offerings for that course
     offs = df_offerings[df_offerings["CourseID"] == course_id]
     if offs.empty:
         base = f"**{code}** – *{title}* is a {credits}-credit course."
         return base + " I don't see any offerings configured yet in the planner data."
 
-    # Format term + session info
     def _fmt_term(term_code) -> str:
-        """
-        Convert things like 'SP26' → 'Spring 2026'.
-        If the code is missing / malformed, just return it as-is.
-        """
         term_code = str(term_code or "").strip()
         if len(term_code) < 4:
             return term_code or "Unknown term"
@@ -542,10 +484,18 @@ st.sidebar.header("Plan settings")
 program_label = st.sidebar.selectbox("Program", list(PROGRAM_CODES.keys()))
 start_term_code = st.sidebar.selectbox("Start term", START_TERMS)
 
+# Certificate options filtered by program
+if PROGRAM_CODES[program_label] == "HOL-EMBA":
+    available_certs = ["Transformational Leadership"]
+    default_certs = ["Transformational Leadership"]
+else:
+    available_certs = list(CERT_LABEL_TO_CODE.keys())
+    default_certs = []
+
 selected_cert_labels = st.sidebar.multiselect(
     "Certificates",
-    list(CERT_LABEL_TO_CODE.keys()),
-    default=["Organizational Consulting"],
+    available_certs,
+    default=default_certs,
     help="Choose one or more OBCC certificates.",
 )
 
@@ -555,18 +505,21 @@ pace_label = st.sidebar.radio(
     index=0,
 )
 
+# Term slider default based on program and certificate
+selected_cert_codes = [CERT_LABEL_TO_CODE[l] for l in selected_cert_labels]
+_default_terms = 7 if PROGRAM_CODES[program_label] == "HOL-EMBA" or "SHR" in selected_cert_codes else 6
+
 max_terms = st.sidebar.slider(
     "Maximum number of terms",
-    min_value=8,
-    max_value=25,      # increased from 16 to 25
-    value=12,
+    min_value=6,
+    max_value=25,
+    value=_default_terms,
 )
 
 generate = st.sidebar.button("Generate plan", type="primary")
 
 # ------------------ main layout ------------------ #
 
-# st.subheader("Generated degree plan")
 st.markdown(
     '<h3 class="section-subheader">Generated degree plan</h3>',
     unsafe_allow_html=True,
@@ -576,7 +529,6 @@ df = None
 cert_codes: list[str] = []
 
 if not generate:
-    # st.info("Configure your plan options in the sidebar and click **Generate plan**.")
     st.markdown(
     """
     <div class="custom-info-box">
@@ -646,13 +598,11 @@ else:
                     )
 
     except Exception as e:
-        # If something goes wrong with the agent, show a clear error
         st.error(
             "Error calling OBCC Vertex AI conversational agent for planning:\n"
             f"{e}"
         )
 
-# st.caption("Tuition estimates are approximate and subject to change.")
 st.markdown(
     """
     <div class="custom-caption">
@@ -678,12 +628,8 @@ def _format_term_label(term_code: str) -> str:
 
 
 def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
-    # Make a copy so we don't mutate the original
     df_local = plan_df.copy()
 
-    # --- Normalize the term column name ---
-    # The planner originally used "term", but the agent/tool might return
-    # something like "Term", "term_code", or "TermCode".
     term_col = None
     for cand in ["term", "Term", "term_code", "TermCode"]:
         if cand in df_local.columns:
@@ -696,37 +642,30 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
             f"Available columns: {list(df_local.columns)}"
         )
 
-    # Rename the detected term column to "term" so the rest of the code works
     if term_col != "term":
         df_local = df_local.rename(columns={term_col: "term"})
 
-    # Portrait letter, mm units
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ----- Title -----
     pdf.set_font("Helvetica", "B", 18)
     from fpdf.enums import XPos, YPos
     pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    # pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
 
-    # ----- Program info block -----
     pdf.set_font("Helvetica", "", 11)
     pdf.multi_cell(0, 5, header_text)
     pdf.ln(3)
 
-    # Column layout (in mm)
     col_course = 25
     col_title = 80
     col_credits = 15
     col_session = 35
     col_tuition = 30
 
-    # Helper to draw table header for each term section
     def draw_table_header():
         pdf.set_font("Helvetica", "B", 10)
-        pdf.set_fill_color(230, 230, 230)  # light gray
+        pdf.set_fill_color(230, 230, 230)
         pdf.cell(col_course, 7, "Course", border=1, align="L", fill=True)
         pdf.cell(col_title, 7, "Course Title", border=1, align="L", fill=True)
         pdf.cell(col_credits, 7, "Hours", border=1, align="C", fill=True)
@@ -737,24 +676,20 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     total_credits = 0
     total_tuition_val = 0
 
-    # Keep the original planner term order
     ordered_terms = list(dict.fromkeys(df_local["term"].tolist()))
 
     for term_code in ordered_terms:
         group = df_local[df_local["term"] == term_code]
 
-        # Term header bar, e.g. "Spring 2026"
         term_label = _format_term_label(term_code)
         pdf.set_font("Helvetica", "B", 12)
-        pdf.set_fill_color(255, 230, 150)  # soft yellow
+        pdf.set_fill_color(255, 230, 150)
         pdf.cell(0, 8, term_label, ln=1, fill=True)
 
-        # Table header for this term
         draw_table_header()
 
-        # Table rows with wrapped titles
         pdf.set_font("Helvetica", "", 10)
-        line_height = 5  # mm
+        line_height = 5
 
         for _, row in group.iterrows():
             course = str(row["course_number"])
@@ -768,33 +703,25 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
 
             x0, y0 = pdf.get_x(), pdf.get_y()
 
-            # How many lines the title will need
-            #title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
             title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
             row_height = line_height * len(title_lines)
 
-            # Course column
             pdf.set_xy(x0, y0)
             pdf.cell(col_course, row_height, course, border=1, align="L")
 
-            # Title column (wrapped)
             pdf.set_xy(x0 + col_course, y0)
             pdf.multi_cell(col_title, line_height, title, border=1, align="L")
 
-            # Move to top-right of the row
             pdf.set_xy(x0 + col_course + col_title, y0)
 
-            # Hours, Session, Tuition
             pdf.cell(col_credits, row_height, str(credits), border=1, align="C")
             pdf.cell(col_session, row_height, session, border=1, align="L")
             pdf.cell(col_tuition, row_height, f"${tuition:,.0f}", border=1, align="R")
 
-            # Next row
             pdf.set_xy(x0, y0 + row_height)
 
         pdf.ln(3)
 
-    # Totals bar
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_fill_color(255, 230, 150)
     pdf.cell(col_course + col_title, 8, "TOTALS", border=1, align="R", fill=True)
@@ -803,14 +730,12 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.cell(col_tuition, 8, f"${total_tuition_val:,.0f}", border=1, align="R", fill=True)
     pdf.ln()
 
-    #raw = pdf.output(dest="S")
     raw = pdf.output()
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
     return raw.encode("latin1")
 
 
-# Only show PDF button when we have a plan
 if df is not None:
     pace_for_pdf = (
         pace_label
@@ -837,11 +762,8 @@ if df is not None:
 
 # ------------- OBCC Course Assistant (simple Q&A at bottom) ------------- #
 
-# st.markdown("---")
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-
-# st.subheader("Ask the OBCC Course Assistant")
 st.markdown(
     '<h3 class="section-subheader">Ask the OBCC Course Assistant</h3>',
     unsafe_allow_html=True,
@@ -852,9 +774,6 @@ st.write(
     "credits, and when it's offered. For example: "
     "`What is OB 6374?` or `When is OB 6334 offered?`"
 )
-
-# Load catalog once (cached)
-#df_courses, df_offerings = load_catalog()
 
 question = st.text_input("Type your question about a course...")
 

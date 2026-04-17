@@ -1,20 +1,3 @@
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.18.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel) (Local)
-#     language: python
-#     name: conda-base-py
-# ---
-
-# %%
-# planner_core.py
-
 import os
 from typing import List, Dict, Any
 
@@ -118,7 +101,7 @@ def get_program_courses(program_code: str, certs: List[str]) -> pd.DataFrame:
     """
     client = get_bq_client()
 
-    # 🔴 Normalize certificate names first
+    # Normalize certificate names first
     norm_certs = normalize_certs(certs)
     want_oc = "OC" in norm_certs
     want_shr = "SHR" in norm_certs
@@ -270,6 +253,16 @@ def get_program_courses(program_code: str, certs: List[str]) -> pd.DataFrame:
         raise ValueError(f"Unknown program_code {program_code}")
 
     df = job.to_dataframe()
+
+    # Override: OB 6342 and OB 6344 are supplemental electives, not cores
+    # BigQuery view does not reflect this correctly
+    df.loc[df["CourseNumber"].isin(["OB 6342", "OB 6344"]), "IsCoreRecommended"] = 0
+    df.loc[df["CourseNumber"].isin(["OB 6342", "OB 6344"]), "CorePriority"] = 2
+
+    # For SHR plans, exclude OB 6393 as it conflicts with Fall slot constraints
+    if "SHR" in norm_certs:
+        df = df[df["CourseNumber"] != "OB 6393"]
+
     df["OrderRank"] = df["OrderRank"].fillna(999)
 
     df = df.sort_values(
@@ -323,7 +316,19 @@ def get_offerings(program_code: str) -> pd.DataFrame:
             query_parameters=[bigquery.ScalarQueryParameter("program_code", "STRING", program_code)]
         ),
     )
-    return job.to_dataframe()
+    df = job.to_dataframe()
+
+    # Override: add missing Fall offerings for OB 6301, OB 6357, OB 6393 for MS LOD
+    # BigQuery view has not picked up the new rows yet
+    if program_code == "MSLOD":
+        extra_rows = pd.DataFrame([
+            {"CourseOfferingID": 112, "CourseID": 8,  "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "TermSeason": "Fall", "PartOfTermCode": "2nd8wk", "SessionLabel": "2nd 8 weeks", "CreditHours": None, "PrimaryFacultyID": 24, "Format": "Online"},
+            {"CourseOfferingID": 113, "CourseID": 21, "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "TermSeason": "Fall", "PartOfTermCode": "1st8wk", "SessionLabel": "1st 8 weeks", "CreditHours": None, "PrimaryFacultyID": 20, "Format": "Online"},
+            {"CourseOfferingID": 114, "CourseID": 22, "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "TermSeason": "Fall", "PartOfTermCode": "2nd8wk", "SessionLabel": "2nd 8 weeks", "CreditHours": None, "PrimaryFacultyID": 21, "Format": "Online"},
+        ])
+        df = pd.concat([df, extra_rows], ignore_index=True)
+
+    return df
 
 
 def get_term_preferences(program_code: str) -> pd.DataFrame:
@@ -405,6 +410,17 @@ def compact_plan_terms(
             if off.empty:
                 return False
 
+            # Enforce Summer cap: max 2 courses and 6 credits
+            if season == "SU":
+                current_courses = len(target_term["courses"])
+                current_credits = target_term["total_credits"]
+                course_credits = next(
+                    (c["credits"] for c in target_term["courses"] if c["course_id"] == course_id),
+                    3  # default to 3 if not found
+                )
+                if current_courses >= 2 or current_credits + course_credits > 6:
+                    return False
+
             needed = prereqs.loc[
                 prereqs["CourseID"] == course_id,
                 "PrerequisiteCourseID"
@@ -471,7 +487,17 @@ def run_planner(
     target_credits: int = 36,
     half_time: bool = False,
 ) -> Dict[str, Any]:
-    max_courses_per_term = 1 if half_time else 2
+
+    # max_courses_per_term is now determined per-term by season, not set globally
+    def get_max_courses(term_code: str) -> int:
+        if half_time:
+            return 1
+        season = term_code[:2]
+        if season == "SU":
+            return 2
+        if program_code == "HOL-EMBA":
+            return 2  # max 2 per SP/FA term to ensure at least 7 terms
+        return 3  # MS LOD can use up to 3 per SP/FA term
 
     courses = get_program_courses(program_code, certs)
     prereqs = get_prereqs(program_code)
@@ -537,91 +563,145 @@ def run_planner(
         term_courses: List[Dict[str, Any]] = []
         term_credits = 0
         term_course_count = 0
-
         used_8wk_slots = set()
+        has_full16wk = False
 
-        for _, row in courses.iterrows():
-            if total_credits_so_far >= target_credits:
-                break
-            if term_course_count >= max_courses_per_term:
-                break
-
-            cid = int(row["CourseID"])
-            if cid in taken:
-                continue
-
-            course_number = row["CourseNumber"]
-
-            prefs = term_pref_map.get(cid)
-            if year == start_year and prefs and season not in prefs:
-                continue
-
-            needed = prereqs.loc[
-                prereqs["CourseID"] == cid,
-                "PrerequisiteCourseID"
-            ].tolist()
-            if not set(needed).issubset(taken):
-                continue
-
-            credits = int(row["DefaultCreditHours"])
-            if total_credits_so_far + credits > target_credits:
-                continue
-
-            offered = offerings[
-                (offerings["CourseID"] == cid) &
-                (offerings["TermCode"] == season)
-            ]
-            if offered.empty:
-                continue
-
-            chosen_slot = None
-            slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
-
-            # Special rule: for HOL-EMBA, force FIN 6301 & OPRE 6301 to Full16wk
-            if program_code == "HOL-EMBA" and course_number in ("FIN 6301", "OPRE 6301"):
-                if "Full16wk" in slots:
-                    chosen_slot = "Full16wk"
-                else:
+        def get_available(df):
+            result = []
+            for _, row in df.iterrows():
+                cid = int(row["CourseID"])
+                if cid in taken:
                     continue
-            else:
-                if season in ("SP", "FA"):
-                    has_real_8wk = any(s in ("1st8wk", "2nd8wk") for s in slots)
+                prefs = term_pref_map.get(cid)
+                if year == start_year and prefs and season not in prefs:
+                    continue
+                needed = prereqs.loc[prereqs["CourseID"] == cid, "PrerequisiteCourseID"].tolist()
+                if not set(needed).issubset(taken):
+                    continue
+                credits = int(row["DefaultCreditHours"])
+                if total_credits_so_far + credits > target_credits:
+                    continue
+                offered = offerings[(offerings["CourseID"] == cid) & (offerings["TermCode"] == season)]
+                if offered.empty:
+                    continue
+                result.append(row)
+            return result
 
-                    if has_real_8wk:
-                        for slot in slots:
-                            if slot in ("1st8wk", "2nd8wk") and slot not in used_8wk_slots:
-                                chosen_slot = slot
-                                break
-                    else:
-                        if "1st8wk" not in used_8wk_slots:
-                            chosen_slot = "1st8wk"
-                        elif "2nd8wk" not in used_8wk_slots:
-                            chosen_slot = "2nd8wk"
-                else:
-                    for slot in slots:
-                        chosen_slot = slot
+        def count_seasons(cid):
+            return len(set(offerings.loc[offerings["CourseID"] == cid, "TermCode"].tolist()))
+
+        def get_ordered_courses():
+            available = get_available(courses)
+            multi_cert = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 0], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            excl_cert  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 0], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            excl_core  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 1], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            multi_core = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 1], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            excl_elec  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 2], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            multi_elec = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 2], key=lambda r: (r["CorePriority"], r["OrderRank"], r["CourseNumber"]))
+            return multi_cert + excl_cert + excl_core + multi_core + excl_elec + multi_elec
+
+        scheduled_this_term = True
+        while scheduled_this_term:
+            scheduled_this_term = False
+
+            for row in get_ordered_courses():
+                if total_credits_so_far >= target_credits:
+                    break
+
+                season = full_term[:2]
+                if season == "SU":
+                    credits = int(row["DefaultCreditHours"])
+                    if term_course_count >= 2:
                         break
+                    if term_credits + credits > 6:
+                        continue
+                else:  # SP or FA
+                    if has_full16wk:
+                        if term_course_count >= 2:
+                            break
+                    else:
+                        if len(used_8wk_slots) >= 3:
+                            break
 
-            if chosen_slot is None:
-                continue
+                cid = int(row["CourseID"])
+                if cid in taken:
+                    continue
 
-            if season in ("SP", "FA") and chosen_slot in ("1st8wk", "2nd8wk"):
-                used_8wk_slots.add(chosen_slot)
+                course_number = row["CourseNumber"]
 
-            label = PART_OF_TERM_LABELS.get(chosen_slot, chosen_slot)
+                prefs = term_pref_map.get(cid)
+                if year == start_year and prefs and season not in prefs:
+                    continue
 
-            term_courses.append({
-                "course_id": cid,
-                "course_number": course_number,
-                "title": row["CourseTitle"],
-                "credits": credits,
-                "part_of_term": chosen_slot,
-                "part_of_term_label": label,
-            })
-            term_credits += credits
-            total_credits_so_far += credits
-            term_course_count += 1
-            taken.add(cid)
+                needed = prereqs.loc[
+                    prereqs["CourseID"] == cid,
+                    "PrerequisiteCourseID"
+                ].tolist()
+                if not set(needed).issubset(taken):
+                    continue
+
+                credits = int(row["DefaultCreditHours"])
+                if total_credits_so_far + credits > target_credits:
+                    continue
+
+                offered = offerings[
+                    (offerings["CourseID"] == cid) &
+                    (offerings["TermCode"] == season)
+                ]
+                if offered.empty:
+                    continue
+
+                chosen_slot = None
+                slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
+
+                if program_code == "HOL-EMBA" and course_number in ("FIN 6301", "OPRE 6301"):
+                    if "Full16wk" in slots:
+                        chosen_slot = "Full16wk"
+                    else:
+                        continue
+                else:
+                    if season in ("SP", "FA"):
+                        has_real_8wk = any(s in ("1st8wk", "2nd8wk") for s in slots)
+                        if has_real_8wk:
+                            for slot in slots:
+                                if slot in ("1st8wk", "2nd8wk") and slot not in used_8wk_slots:
+                                    chosen_slot = slot
+                                    break
+                        else:
+                            if "1st8wk" not in used_8wk_slots:
+                                chosen_slot = "1st8wk"
+                            elif "2nd8wk" not in used_8wk_slots:
+                                chosen_slot = "2nd8wk"
+                    else:
+                        for slot in slots:
+                            chosen_slot = slot
+                            break
+
+                if chosen_slot is None:
+                    continue
+
+                if season in ("SP", "FA"):
+                    if chosen_slot == "Full16wk":
+                        has_full16wk = True
+                    elif chosen_slot in ("1st8wk", "2nd8wk"):
+                        used_8wk_slots.add(chosen_slot)
+
+                label = PART_OF_TERM_LABELS.get(chosen_slot, chosen_slot)
+
+                term_courses.append({
+                    "course_id": cid,
+                    "course_number": course_number,
+                    "title": row["CourseTitle"],
+                    "credits": credits,
+                    "part_of_term": chosen_slot,
+                    "part_of_term_label": label,
+                })
+                term_credits += credits
+                total_credits_so_far += credits
+                term_course_count += 1
+                taken.add(cid)
+                scheduled_this_term = True
+                break  # restart while loop with fresh course list
 
         if term_courses:
             term_courses.sort(key=lambda c: part_order.get(c["part_of_term"], 99))
@@ -635,12 +715,141 @@ def run_planner(
         if total_credits_so_far >= target_credits:
             break
 
+        season = full_term[:2]
+        compact_max = 2 if season == "SU" else 3
         plan_terms = compact_plan_terms(
             plan_terms=plan_terms,
-            max_courses_per_term=max_courses_per_term,
+            max_courses_per_term=compact_max,
             offerings=offerings,
             prereqs=prereqs,
         )
+
+    # Post-processing: if short on credits, try to fill remaining slots
+    if total_credits_so_far < target_credits:
+        # First try to fill existing terms
+        for term in plan_terms:
+            if total_credits_so_far >= target_credits:
+                break
+            season = term["term_code"][:2]
+            max_slots = 2 if season == "SU" else 3
+            if len(term["courses"]) >= max_slots:
+                continue
+            for _, row in courses.iterrows():
+                if total_credits_so_far >= target_credits:
+                    break
+                cid = int(row["CourseID"])
+                if cid in taken:
+                    continue
+                credits = int(row["DefaultCreditHours"])
+                offered = offerings[
+                    (offerings["CourseID"] == cid) &
+                    (offerings["TermCode"] == season)
+                ]
+                if offered.empty:
+                    continue
+                needed = prereqs.loc[
+                    prereqs["CourseID"] == cid,
+                    "PrerequisiteCourseID"
+                ].tolist()
+                if not set(needed).issubset(taken):
+                    continue
+                if season == "SU" and (len(term["courses"]) >= 2 or term["total_credits"] + credits > 6):
+                    continue
+                slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
+                used = {c["part_of_term"] for c in term["courses"]}
+                chosen_slot = None
+                if season == "SU":
+                    for slot in slots:
+                        chosen_slot = slot
+                        break
+                else:
+                    for slot in slots:
+                        if slot not in used:
+                            chosen_slot = slot
+                            break
+                if chosen_slot is None:
+                    continue
+                label = PART_OF_TERM_LABELS.get(chosen_slot, chosen_slot)
+                term["courses"].append({
+                    "course_id": cid,
+                    "course_number": row["CourseNumber"],
+                    "title": row["CourseTitle"],
+                    "credits": credits,
+                    "part_of_term": chosen_slot,
+                    "part_of_term_label": label,
+                })
+                term["total_credits"] += credits
+                total_credits_so_far += credits
+                taken.add(cid)
+
+        # If still short, create missing terms from the sequence
+        if total_credits_so_far < target_credits:
+            existing_terms = {t["term_code"] for t in plan_terms}
+            for full_term in term_seq:
+                if total_credits_so_far >= target_credits:
+                    break
+                if full_term in existing_terms:
+                    continue
+                season = full_term[:2]
+                new_term_courses = []
+                new_term_credits = 0
+                for _, row in courses.iterrows():
+                    if total_credits_so_far >= target_credits:
+                        break
+                    max_slots = 2 if season == "SU" else 3
+                    if len(new_term_courses) >= max_slots:
+                        break
+                    cid = int(row["CourseID"])
+                    if cid in taken:
+                        continue
+                    credits = int(row["DefaultCreditHours"])
+                    offered = offerings[
+                        (offerings["CourseID"] == cid) &
+                        (offerings["TermCode"] == season)
+                    ]
+                    if offered.empty:
+                        continue
+                    needed = prereqs.loc[
+                        prereqs["CourseID"] == cid,
+                        "PrerequisiteCourseID"
+                    ].tolist()
+                    if not set(needed).issubset(taken):
+                        continue
+                    if season == "SU" and (len(new_term_courses) >= 2 or new_term_credits + credits > 6):
+                        continue
+                    slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
+                    used = {c["part_of_term"] for c in new_term_courses}
+                    chosen_slot = None
+                    if season == "SU":
+                        for slot in slots:
+                            chosen_slot = slot
+                            break
+                    else:
+                        for slot in slots:
+                            if slot not in used:
+                                chosen_slot = slot
+                                break
+                    if chosen_slot is None:
+                        continue
+                    label = PART_OF_TERM_LABELS.get(chosen_slot, chosen_slot)
+                    new_term_courses.append({
+                        "course_id": cid,
+                        "course_number": row["CourseNumber"],
+                        "title": row["CourseTitle"],
+                        "credits": credits,
+                        "part_of_term": chosen_slot,
+                        "part_of_term_label": label,
+                    })
+                    new_term_credits += credits
+                    total_credits_so_far += credits
+                    taken.add(cid)
+                if new_term_courses:
+                    plan_terms.append({
+                        "term_code": full_term,
+                        "total_credits": new_term_credits,
+                        "courses": new_term_courses,
+                    })
+                    plan_terms.sort(key=lambda t: term_seq.index(t["term_code"]))
 
     return {
         "program_code": program_code,
