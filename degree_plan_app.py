@@ -114,6 +114,12 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
     margin: 1.5rem 0;
 }
 
+.slider-end-label {
+    color: #FAFAFA;
+    font-size: 13px;
+    margin-top: -1.8rem;
+}
+
 /* Chintan - CSS Changes end */
 
     .info-banner {
@@ -562,6 +568,16 @@ max_terms = st.sidebar.slider(
     value=12,
 )
 
+# ------
+
+col_min, col_spacer, col_max = st.sidebar.columns([1, 6, 1])
+with col_min:
+    st.markdown('<div class="slider-end-label">8</div>', unsafe_allow_html=True)
+with col_max:
+    st.markdown('<div class="slider-end-label" style="text-align: right;">25</div>', unsafe_allow_html=True)
+
+# ------
+
 generate = st.sidebar.button("Generate plan", type="primary")
 
 # ------------------ main layout ------------------ #
@@ -707,9 +723,9 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
 
     # ----- Title -----
     pdf.set_font("Helvetica", "B", 18)
-    from fpdf.enums import XPos, YPos
-    pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    # pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
+    pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
+    # from fpdf.enums import XPos, YPos
+    # pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # ----- Program info block -----
     pdf.set_font("Helvetica", "", 11)
@@ -769,8 +785,8 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
             x0, y0 = pdf.get_x(), pdf.get_y()
 
             # How many lines the title will need
-            #title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
-            title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
+            title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
+            # title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
             row_height = line_height * len(title_lines)
 
             # Course column
@@ -803,8 +819,8 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.cell(col_tuition, 8, f"${total_tuition_val:,.0f}", border=1, align="R", fill=True)
     pdf.ln()
 
-    #raw = pdf.output(dest="S")
-    raw = pdf.output()
+    raw = pdf.output(dest="S")
+    # raw = pdf.output()
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
     return raw.encode("latin1")
