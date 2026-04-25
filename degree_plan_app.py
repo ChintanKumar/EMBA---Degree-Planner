@@ -13,6 +13,7 @@
 # ---
 
 # %%
+import os
 import requests
 import streamlit as st
 import pandas as pd
@@ -201,11 +202,16 @@ st.markdown(
 
 # ------------------ constants ------------------ #
 
-# Original planner API URL (kept here for reference / fallback if needed)
-PLANNER_API_URL = (
+PLANNER_API_URL = os.environ.get(
+    "BACKEND_URL",
     "http://localhost:8000/plan"
-    # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
 )
+
+# Original planner API URL (kept here for reference / fallback if needed)
+# PLANNER_API_URL = (
+#     "http://localhost:8000/plan"
+#     # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
+# )
 
 PROGRAM_CODES = {
     "MS LOD": "MSLOD",
@@ -234,9 +240,13 @@ PACE_LABEL_TO_HALF_TIME = {
 
 # ---------- Vertex AI Conversational Agent (Dialogflow CX) config ----------
 
-DF_PROJECT_ID = "obcc-degree-planner-489404"
-DF_LOCATION_ID = "us"
-DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
+DF_PROJECT_ID = os.environ.get("DF_PROJECT_ID", "obcc-degree-planner-489404")
+DF_LOCATION_ID = os.environ.get("DF_LOCATION_ID", "us-central1")
+DF_AGENT_ID = os.environ.get("DF_AGENT_ID", "1d7f500e-0fbf-4fec-afe0-5f24836dd677")
+
+# DF_PROJECT_ID = "obcc-degree-planner-489404"
+# DF_LOCATION_ID = "us"
+# DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
 DF_AGENT_PATH = (
     f"projects/{DF_PROJECT_ID}/locations/{DF_LOCATION_ID}/agents/{DF_AGENT_ID}"
 )
