@@ -1,3 +1,4 @@
+# Degree Plan
 # ---
 # jupyter:
 #   jupytext:
@@ -347,21 +348,23 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
     except Exception:
         agent_rows = []
 
-    planner_rows: list[dict] = []
     try:
         resp = requests.post(PLANNER_API_URL, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
+        # Multiple plans response — return the whole dict so the caller can handle it
+        if "plans" in data:
+            return data
+        # Single plan response — return the rows list
         planner_rows = data.get("rows", []) or []
+        if planner_rows:
+            return planner_rows
     except Exception as planner_err:
         if agent_rows:
             return agent_rows
         raise RuntimeError(
             f"Planner API failed after calling the agent: {planner_err}"
         )
-
-    if planner_rows:
-        return planner_rows
 
     if agent_rows:
         return agent_rows
@@ -478,13 +481,31 @@ def answer_course_question(
 
 
 # ------------------ sidebar ------------------ #
+# The sidebar contains all the inputs the user needs to configure their plan.
+# Each input maps to a parameter sent to the /plan API endpoint.
 
 st.sidebar.header("Plan settings")
 
+# Program selection — determines which degree (MS LOD or EMBA HOL)
+# and affects available certificates, default term count, and target credits
 program_label = st.sidebar.selectbox("Program", list(PROGRAM_CODES.keys()))
-start_term_code = st.sidebar.selectbox("Start term", START_TERMS)
+# Start term — defaults to the next full term based on current month.
+# Jan-May -> Fall of current year, Jun-Dec -> Spring of next year.
+# Summer is intentionally excluded as a default since it is not a full term.
+from datetime import datetime
+_now = datetime.now()
+_year = _now.year % 100  # e.g. 2026 -> 26
+if _now.month <= 5:
+    _default_start = f"FA{_year:02d}"
+else:
+    _default_start = f"SP{_year + 1:02d}"
+_default_start_idx = START_TERMS.index(_default_start) if _default_start in START_TERMS else 0
 
-# Certificate options filtered by program
+start_term_code = st.sidebar.selectbox("Start term", START_TERMS, index=_default_start_idx)
+
+# Certificate selection — filtered by program.
+# EMBA HOL only supports Transformational Leadership (pre-selected).
+# MS LOD supports all 4 certificates.
 if PROGRAM_CODES[program_label] == "HOL-EMBA":
     available_certs = ["Transformational Leadership"]
     default_certs = ["Transformational Leadership"]
@@ -499,13 +520,17 @@ selected_cert_labels = st.sidebar.multiselect(
     help="Choose one or more OBCC certificates.",
 )
 
+# Pace — full-time allows up to the dynamic max courses per term.
+# Half-time caps at 1 course per term regardless of season.
 pace_label = st.sidebar.radio(
     "Pace",
     ["Full-time", "Half-time (<= 8 credits / long term)"],
     index=0,
 )
 
-# Term slider default based on program and certificate
+# Term slider — controls how many terms the plan is spread across.
+# Default is 6 for MS LOD, 7 for EMBA HOL and SHR (which need more terms).
+# Higher values produce lighter-load plans spread across more semesters.
 selected_cert_codes = [CERT_LABEL_TO_CODE[l] for l in selected_cert_labels]
 _default_terms = 7 if PROGRAM_CODES[program_label] == "HOL-EMBA" or "SHR" in selected_cert_codes else 6
 
@@ -516,9 +541,65 @@ max_terms = st.sidebar.slider(
     value=_default_terms,
 )
 
+# Plan versions — generates multiple slightly different plans.
+# Variations differ in which electives fill the remaining slots
+# and which terms optional courses land in.
+num_plans = st.sidebar.slider(
+    "Number of plan versions",
+    min_value=1,
+    max_value=3,
+    value=1,
+    help="Generate multiple variations of the degree plan.",
+)
+
+# Summer toggle — when off, Summer terms are completely skipped.
+# Courses that are Summer-only will still be included but moved to
+# the nearest available Fall or Spring term.
+include_summer = st.sidebar.toggle(
+    "Include Summer terms",
+    value=True,
+    help="When off, Summer terms are skipped and courses spread across Spring and Fall only.",
+)
+
+# Breaks section — allows students to mark semesters they won't be enrolled
+st.sidebar.markdown("---")
+enable_breaks = st.sidebar.toggle(
+    "Add semester breaks",
+    value=False,
+    help="Enable if the student needs to skip one or more semesters.",
+)
+
+break_terms = []
+if enable_breaks:
+    # Only show SP and FA terms as break options (Summer is already optional)
+    break_term_options = [t for t in START_TERMS if not t.startswith("SU")]
+    break1 = st.sidebar.selectbox(
+        "Break semester 1",
+        ["None"] + break_term_options,
+        index=0,
+    )
+    if break1 != "None":
+        break_terms.append(break1)
+
+    break2 = st.sidebar.selectbox(
+        "Break semester 2",
+        ["None"] + [t for t in break_term_options if t != break1],
+        index=0,
+    )
+    if break2 != "None":
+        break_terms.append(break2)
+
+# FIX 1: Reset plan_generated flag whenever Generate plan is clicked.
+# This ensures the generation block runs even after a previous run,
+# and prevents navigation button clicks from re-triggering generation.
 generate = st.sidebar.button("Generate plan", type="primary")
+if generate:
+    st.session_state["plan_generated"] = False
 
 # ------------------ main layout ------------------ #
+# This section handles plan generation and display.
+# Plans are stored in st.session_state so navigation between
+# versions works without regenerating the plan.
 
 st.markdown(
     '<h3 class="section-subheader">Generated degree plan</h3>',
@@ -528,7 +609,7 @@ st.markdown(
 df = None
 cert_codes: list[str] = []
 
-if not generate:
+if not generate and "all_plans" not in st.session_state:
     st.markdown(
     """
     <div class="custom-info-box">
@@ -537,19 +618,25 @@ if not generate:
     """,
     unsafe_allow_html=True,
 )
-else:
+# FIX 2: Use elif (not else) so this block is skipped when navigating between plans.
+# The plan_generated flag is False only right after Generate is clicked,
+# so navigation button clicks (which set plan_index and rerun) skip this block entirely.
+elif not st.session_state.get("plan_generated", False):
     # Map UI labels -> API codes
     program_code = PROGRAM_CODES[program_label]
     cert_codes = [CERT_LABEL_TO_CODE[label] for label in selected_cert_labels]
     half_time = PACE_LABEL_TO_HALF_TIME[pace_label]
 
-    # Build the payload we want the agent's planner tool to use
+    # Build the payload
     payload = {
         "program_code": program_code,
         "start_term_code": start_term_code,
         "half_time": half_time,
         "certs": cert_codes,
         "max_terms": max_terms,
+        "num_plans": num_plans,
+        "include_summer": include_summer,  # whether to schedule courses in Summer terms
+        "break_terms": break_terms,            # semesters the student will skip
     }
 
     try:
@@ -562,46 +649,146 @@ else:
                 "Check your agent tool configuration or planner logic."
             )
         else:
-            df = pd.DataFrame(rows)
+            # Handle multiple plans response
+            if isinstance(rows, dict) and "plans" in rows:
+                all_plans = rows["plans"]
+            else:
+                # Single plan or already-extracted rows
+                all_plans = [{"variation": 1, "rows": rows if isinstance(rows, list) else rows.get("rows", [])}]
 
-            st.markdown(
-                f"Plan generated for **{program_label}**, starting **{start_term_code}**, "
-                f"Pace: **{pace_label.split()[0]}**, "
-                f"Certificates: **{', '.join(cert_codes) if cert_codes else 'None'}**."
-            )
+            # FIX 3: Mark generation complete BEFORE storing plans in session state.
+            # This is the critical flag that prevents re-generation on navigation reruns.
+            st.session_state["plan_generated"] = True
 
-            st.dataframe(df, use_container_width=True)
-
-            total_hours = df["credits"].sum() if "credits" in df.columns else None
-            total_tuition = df["tuition"].sum() if "tuition" in df.columns else None
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                if total_hours is not None:
-                    st.markdown(
-                        f"""
-                        <div class="summary-metric-label">Total credits</div>
-                        <div class="summary-metric-value">{int(total_hours)}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-            with col2:
-                if total_tuition is not None:
-                    st.markdown(
-                        f"""
-                        <div class="summary-metric-label">Total tuition (estimate)</div>
-                        <div class="summary-metric-value">${int(total_tuition):,}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+            # Store plans in session state
+            st.session_state["all_plans"] = all_plans
+            st.session_state["plan_index"] = 0
+            st.session_state["plan_meta"] = {
+                "program_label": program_label,
+                "start_term_code": start_term_code,
+                "pace_label": pace_label,
+                "cert_codes": cert_codes,
+                "max_terms": max_terms,
+                "include_summer": include_summer,
+                "break_terms": break_terms,
+            }
 
     except Exception as e:
         st.error(
             "Error calling OBCC Vertex AI conversational agent for planning:\n"
             f"{e}"
         )
+
+# Display plans from session state
+if "all_plans" in st.session_state and st.session_state["all_plans"]:
+    all_plans = st.session_state["all_plans"]
+    plan_index = st.session_state.get("plan_index", 0)
+    meta = st.session_state.get("plan_meta", {})
+
+    current_plan = all_plans[plan_index]
+    current_rows = current_plan.get("rows", [])
+    total_plans = len(all_plans)
+    
+    # Check if all plans are identical — only relevant when multiple versions requested
+    all_rows = [json.dumps(p.get("rows", []), sort_keys=True) for p in all_plans]
+    plans_are_identical = len(set(all_rows)) == 1
+
+    # Navigation header — only show if multiple plans AND they differ
+    if total_plans > 1 and not plans_are_identical:
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+        with nav_col1:
+            if st.button("← Previous", disabled=(plan_index == 0)):
+                st.session_state["plan_index"] = plan_index - 1
+                st.rerun()
+        with nav_col2:
+            st.markdown(
+                f"<div style='text-align:center; padding-top:0.4rem; font-weight:600;'>Plan {plan_index + 1} of {total_plans}</div>",
+                unsafe_allow_html=True,
+            )
+        with nav_col3:
+            if st.button("Next →", disabled=(plan_index == total_plans - 1)):
+                st.session_state["plan_index"] = plan_index + 1
+                st.rerun()
+
+    elif total_plans > 1 and plans_are_identical:
+        st.markdown(
+            """
+            <div class="custom-info-box">
+                Only one unique plan could be generated for this program and certificate combination — all required courses have fixed scheduling with no room for variation.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f"Plan generated for **{meta.get('program_label', '')}**, "
+        f"starting **{meta.get('start_term_code', '')}**, "
+        f"Pace: **{meta.get('pace_label', '').split()[0]}**, "
+        f"Certificates: **{', '.join(meta.get('cert_codes', [])) if meta.get('cert_codes') else 'None'}**."
+    )
+
+    # Add break term rows to the display dataframe
+    # Break terms show as a single row with "SEMESTER BREAK" in the course title
+    _meta_breaks = meta.get("break_terms", [])
+    _break_rows = []
+    for bt in _meta_breaks:
+        _break_rows.append({
+            "term": bt,
+            "course_number": "—",
+            "course_title": "⏸ Semester Break",
+            "credits": 0,
+            "session": "—",
+            "tuition": 0,
+        })
+
+    if _break_rows:
+        _break_df = pd.DataFrame(_break_rows)
+        _all_rows = current_rows + _break_rows
+        # Re-sort by term order using the START_TERMS list as reference
+        _term_order = {t: i for i, t in enumerate(START_TERMS)}
+        _all_rows.sort(key=lambda r: _term_order.get(r["term"], 999))
+        df = pd.DataFrame(_all_rows)
+    else:
+        df = pd.DataFrame(current_rows)
+
+    st.dataframe(df, use_container_width=True)
+
+    total_hours = df["credits"].sum() if "credits" in df.columns else None
+    total_tuition = df["tuition"].sum() if "tuition" in df.columns else None
+    # Count only actual course terms (exclude break rows)
+    total_terms = len(set(r["term"] for r in current_rows)) if current_rows else None
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if total_hours is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total credits</div>
+                <div class="summary-metric-value">{int(total_hours)}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with col2:
+        if total_terms is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total semesters</div>
+                <div class="summary-metric-value">{total_terms}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with col3:
+        if total_tuition is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total tuition (estimate)</div>
+                <div class="summary-metric-value">${int(total_tuition):,}</div>
+                """,
+                unsafe_allow_html=True,
+            )
 
 st.markdown(
     """
@@ -613,6 +800,9 @@ st.markdown(
 )
 
 # ------------- PDF download ------------- #
+# Generates a formatted PDF of the currently displayed plan.
+# The PDF includes the plan header, a term-by-term course table,
+# and a totals row with total credits and tuition estimate.
 
 
 def _format_term_label(term_code: str) -> str:
@@ -737,30 +927,49 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
 
 
 if df is not None:
+    meta = st.session_state.get("plan_meta", {})
+    plan_index = st.session_state.get("plan_index", 0)
+    pace_label_pdf = meta.get("pace_label", "")
+    cert_codes_pdf = meta.get("cert_codes", [])
+    max_terms_pdf = meta.get("max_terms", 6)
+    program_label_pdf = meta.get("program_label", "")
+    start_term_code_pdf = meta.get("start_term_code", "")
+    total_plans = len(st.session_state.get("all_plans", []))
+
     pace_for_pdf = (
-        pace_label
+        pace_label_pdf
         .replace("≤", "<=")
         .replace("–", "-")
     )
 
+    plan_label = f" (Version {plan_index + 1} of {total_plans})" if total_plans > 1 else ""
+    breaks_pdf = meta.get("break_terms", [])
+    breaks_label = f"\nBreaks: {', '.join(breaks_pdf)}" if breaks_pdf else ""
+
     header_txt = (
-        f"Program: {program_label}\n"
-        f"Start term: {start_term_code}\n"
+        f"Program: {program_label_pdf}{plan_label}\n"
+        f"Start term: {start_term_code_pdf}\n"
         f"Pace: {pace_for_pdf}\n"
-        f"Certificates: {', '.join(cert_codes) if cert_codes else 'None'}\n"
-        f"Max terms: {max_terms}"
+        f"Certificates: {', '.join(cert_codes_pdf) if cert_codes_pdf else 'None'}\n"
+        f"Max terms: {max_terms_pdf}"
+        f"{breaks_label}"
     )
 
-    pdf_bytes = make_pdf(df, header_txt)
+    # Filter out break rows before generating PDF (break rows have 0 credits)
+    df_pdf = df[df["course_number"] != "—"].copy() if df is not None else df
+    pdf_bytes = make_pdf(df_pdf, header_txt)
 
     st.download_button(
-        "Download degree plan as PDF",
+        f"Download degree plan as PDF",
         data=pdf_bytes,
-        file_name="obcc_degree_plan.pdf",
+        file_name=f"obcc_degree_plan_v{plan_index + 1}.pdf",
         mime="application/pdf",
     )
 
 # ------------- OBCC Course Assistant (simple Q&A at bottom) ------------- #
+# Simple course lookup tool. The user types a course number (e.g. "OB 6374")
+# and the assistant returns the course name, credits, and when it is offered.
+# Uses cached BigQuery data to avoid repeated API calls.
 
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
