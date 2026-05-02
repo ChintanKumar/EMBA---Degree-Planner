@@ -14,6 +14,7 @@
 # ---
 
 # %%
+import os
 import requests
 import streamlit as st
 import pandas as pd
@@ -21,7 +22,7 @@ from fpdf import FPDF
 import re
 import json
 import uuid
-import ast 
+import ast
 from google.cloud import bigquery
 from google.cloud.dialogflowcx_v3.services.sessions import SessionsClient
 from google.cloud.dialogflowcx_v3.types import session as cx_session
@@ -196,10 +197,10 @@ st.markdown(
 
 # ------------------ constants ------------------ #
 
-# Original planner API URL (kept here for reference / fallback if needed)
-PLANNER_API_URL = (
-    "http://localhost:8001/plan"
-    # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
+# Planner API URL - configurable via environment variable
+PLANNER_API_URL = os.environ.get(
+    "PLANNER_API_URL",
+    "http://localhost:8000/plan"
 )
 
 PROGRAM_CODES = {
@@ -520,12 +521,21 @@ selected_cert_labels = st.sidebar.multiselect(
     help="Choose one or more OBCC certificates.",
 )
 
+# Show info message when SHR is selected
+if "Strategic Human Resources" in selected_cert_labels:
+    st.sidebar.info(
+        "ℹ️ Plans with the SHR certificate typically require 7 terms due to "
+        "Fall-only course scheduling constraints."
+    )
+
 # Pace — full-time allows up to the dynamic max courses per term.
 # Half-time caps at 1 course per term regardless of season.
-pace_label = st.sidebar.radio(
+# Financial Aid Eligible enforces minimum credits per term.
+pace_label = st.sidebar.selectbox(
     "Pace",
-    ["Full-time", "Half-time (<= 8 credits / long term)"],
+    ["Full-time", "Half-time (<= 8 credits / long term)", "Financial Aid Eligible"],
     index=0,
+    help="Financial Aid Eligible pacing ensures every term meets minimum credit requirements: Fall/Spring ≥ 5 SCH, Summer ≥ 3 SCH",
 )
 
 # Term slider — controls how many terms the plan is spread across.
@@ -589,12 +599,11 @@ if enable_breaks:
     if break2 != "None":
         break_terms.append(break2)
 
-# FIX 1: Reset plan_generated flag whenever Generate plan is clicked.
-# This ensures the generation block runs even after a previous run,
-# and prevents navigation button clicks from re-triggering generation.
+# Set flags to control generation vs navigation
 generate = st.sidebar.button("Generate plan", type="primary")
 if generate:
-    st.session_state["plan_generated"] = False
+    st.session_state["generate_clicked"] = True
+    st.session_state["plans_loaded"] = False
 
 # ------------------ main layout ------------------ #
 # This section handles plan generation and display.
@@ -618,20 +627,26 @@ if not generate and "all_plans" not in st.session_state:
     """,
     unsafe_allow_html=True,
 )
-# FIX 2: Use elif (not else) so this block is skipped when navigating between plans.
-# The plan_generated flag is False only right after Generate is clicked,
-# so navigation button clicks (which set plan_index and rerun) skip this block entirely.
-elif not st.session_state.get("plan_generated", False):
+# Only run generation if Generate button was clicked and plans haven't been loaded yet
+elif st.session_state.get("generate_clicked", False) and not st.session_state.get("plans_loaded", False):
     # Map UI labels -> API codes
     program_code = PROGRAM_CODES[program_label]
     cert_codes = [CERT_LABEL_TO_CODE[label] for label in selected_cert_labels]
-    half_time = PACE_LABEL_TO_HALF_TIME[pace_label]
+
+    # Determine pacing parameters
+    if pace_label == "Financial Aid Eligible":
+        half_time = False
+        financial_aid_pacing = True
+    else:
+        half_time = PACE_LABEL_TO_HALF_TIME.get(pace_label, False)
+        financial_aid_pacing = False
 
     # Build the payload
     payload = {
         "program_code": program_code,
         "start_term_code": start_term_code,
         "half_time": half_time,
+        "financial_aid_pacing": financial_aid_pacing,
         "certs": cert_codes,
         "max_terms": max_terms,
         "num_plans": num_plans,
@@ -656,9 +671,9 @@ elif not st.session_state.get("plan_generated", False):
                 # Single plan or already-extracted rows
                 all_plans = [{"variation": 1, "rows": rows if isinstance(rows, list) else rows.get("rows", [])}]
 
-            # FIX 3: Mark generation complete BEFORE storing plans in session state.
-            # This is the critical flag that prevents re-generation on navigation reruns.
-            st.session_state["plan_generated"] = True
+            # Mark generation complete and plans loaded
+            st.session_state["generate_clicked"] = False
+            st.session_state["plans_loaded"] = True
 
             # Store plans in session state
             st.session_state["all_plans"] = all_plans

@@ -470,6 +470,7 @@ def run_planner(
     max_terms: int = 20,
     target_credits: int = 36,
     half_time: bool = False,
+    financial_aid_pacing: bool = False,
 ) -> Dict[str, Any]:
     max_courses_per_term = 1 if half_time else 2
 
@@ -477,6 +478,25 @@ def run_planner(
     prereqs = get_prereqs(program_code)
     offerings = get_offerings(program_code)
     term_prefs_df = get_term_preferences(program_code)
+
+    # Separate coaching courses for special handling
+    norm_certs = normalize_certs(certs)
+    want_coaching = "COACH" in norm_certs
+    coaching_courses = []
+    non_coaching_courses = []
+
+    if want_coaching:
+        # Split courses into coaching and non-coaching
+        for _, row in courses.iterrows():
+            is_coaching = row.get("IsCoaching", 0) == 1
+            if is_coaching:
+                coaching_courses.append(row)
+            else:
+                non_coaching_courses.append(row)
+        # Sort coaching courses by CourseNumber for strict sequence
+        coaching_courses.sort(key=lambda r: r["CourseNumber"])
+    else:
+        non_coaching_courses = [row for _, row in courses.iterrows()]
 
     # Manual prereq override: FIN 6301 requires OPRE 6301 for HOL-EMBA
     if program_code == "HOL-EMBA":
@@ -527,6 +547,10 @@ def run_planner(
 
     part_order = {"1st8wk": 0, "2nd8wk": 1, "Full16wk": 2}
 
+    # Track which terms have coaching Full16wk courses
+    coaching_terms = set()
+    coaching_index = 0
+
     for full_term in term_seq:
         if total_credits_so_far >= target_credits:
             break
@@ -540,11 +564,67 @@ def run_planner(
 
         used_8wk_slots = set()
 
-        for _, row in courses.iterrows():
+        # Determine minimum credits for financial aid pacing
+        min_credits_for_term = 0
+        if financial_aid_pacing:
+            if season in ("SP", "FA"):
+                min_credits_for_term = 5
+            else:  # Summer
+                min_credits_for_term = 3
+
+        # COACHING: Schedule one coaching course per term in strict sequence
+        if want_coaching and coaching_index < len(coaching_courses):
+            row = coaching_courses[coaching_index]
+            cid = int(row["CourseID"])
+            course_number = row["CourseNumber"]
+
+            # Check if this coaching course is offered this season in Full16wk
+            offered = offerings[
+                (offerings["CourseID"] == cid) &
+                (offerings["TermCode"] == season)
+            ]
+
+            if not offered.empty:
+                # Check if Full16wk is available
+                slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
+                if "Full16wk" in slots:
+                    # Check prerequisites
+                    needed = prereqs.loc[
+                        prereqs["CourseID"] == cid,
+                        "PrerequisiteCourseID"
+                    ].tolist()
+
+                    if set(needed).issubset(taken):
+                        # Schedule this coaching course
+                        credits = int(row["DefaultCreditHours"])
+                        if total_credits_so_far + credits <= target_credits:
+                            term_courses.append({
+                                "course_id": cid,
+                                "course_number": course_number,
+                                "title": row["CourseTitle"],
+                                "credits": credits,
+                                "part_of_term": "Full16wk",
+                                "part_of_term_label": PART_OF_TERM_LABELS["Full16wk"],
+                            })
+                            term_credits += credits
+                            total_credits_so_far += credits
+                            term_course_count += 1
+                            taken.add(cid)
+                            coaching_terms.add(full_term)
+                            coaching_index += 1
+
+        # Now schedule non-coaching courses
+        for row in non_coaching_courses:
             if total_credits_so_far >= target_credits:
                 break
-            if term_course_count >= max_courses_per_term:
-                break
+            # For financial aid pacing, enforce minimum credits instead of max courses
+            if financial_aid_pacing:
+                # Continue adding courses if we haven't met the minimum
+                if term_credits >= min_credits_for_term and term_course_count >= max_courses_per_term:
+                    break
+            else:
+                if term_course_count >= max_courses_per_term:
+                    break
 
             cid = int(row["CourseID"])
             if cid in taken:
@@ -576,6 +656,12 @@ def run_planner(
 
             chosen_slot = None
             slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
+
+            # COACHING: Remove Full16wk slot if this term has a coaching course
+            if full_term in coaching_terms and "Full16wk" in slots:
+                slots = [s for s in slots if s != "Full16wk"]
+                if not slots:
+                    continue
 
             # Special rule: for HOL-EMBA, force FIN 6301 & OPRE 6301 to Full16wk
             if program_code == "HOL-EMBA" and course_number in ("FIN 6301", "OPRE 6301"):
@@ -624,13 +710,21 @@ def run_planner(
             taken.add(cid)
 
         if term_courses:
-            term_courses.sort(key=lambda c: part_order.get(c["part_of_term"], 99))
+            # For financial aid pacing, only include terms that meet minimum credit requirements
+            if financial_aid_pacing and term_credits < min_credits_for_term:
+                # Skip this term - doesn't meet financial aid minimum
+                # Put courses back in the pool for next term
+                for c in term_courses:
+                    taken.discard(c["course_id"])
+                    total_credits_so_far -= c["credits"]
+            else:
+                term_courses.sort(key=lambda c: part_order.get(c["part_of_term"], 99))
 
-            plan_terms.append({
-                "term_code": full_term,
-                "total_credits": term_credits,
-                "courses": term_courses,
-            })
+                plan_terms.append({
+                    "term_code": full_term,
+                    "total_credits": term_credits,
+                    "courses": term_courses,
+                })
 
         if total_credits_so_far >= target_credits:
             break

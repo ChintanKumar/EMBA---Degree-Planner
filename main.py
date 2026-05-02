@@ -32,7 +32,11 @@ class DegreePlannerRequest(BaseModel):
     start_term_code: str           # e.g. "SP26"
     certs: Optional[List[str]] = None   # e.g. ["OC", "TL"]
     half_time: bool = False
+    financial_aid_pacing: bool = False  # Enforce min credits per term (5 SCH Fall/Spring, 3 SCH Summer)
     max_terms: int = 20
+    num_plans: int = 1             # Number of plan variations to generate
+    include_summer: bool = True    # Whether to include summer terms
+    break_terms: Optional[List[str]] = None  # Terms to skip (e.g. ["SP26", "FA27"])
     target_credits: Optional[int] = None
     return_rows: bool = True       # if True, return flattened rows; else full plan
 
@@ -70,6 +74,7 @@ def generate_plan(body: DegreePlannerRequest):
         start_term_code=body.start_term_code,
         certs=certs,
         half_time=body.half_time,
+        financial_aid_pacing=body.financial_aid_pacing,
         max_terms=body.max_terms,
         target_credits=target,
     )
