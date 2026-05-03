@@ -206,16 +206,8 @@ st.markdown(
 # Planner API URL - configurable via environment variable
 PLANNER_API_URL = os.environ.get(
     "PLANNER_API_URL",
-PLANNER_API_URL = os.environ.get(
-    "BACKEND_URL",
     "http://localhost:8000/plan"
 )
-
-# Original planner API URL (kept here for reference / fallback if needed)
-# PLANNER_API_URL = (
-#     "http://localhost:8000/plan"
-#     # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
-# )
 
 PROGRAM_CODES = {
     "MS LOD": "MSLOD",
@@ -785,7 +777,6 @@ if "all_plans" in st.session_state and st.session_state["all_plans"]:
         })
 
     if _break_rows:
-        _break_df = pd.DataFrame(_break_rows)
         _all_rows = current_rows + _break_rows
         # Re-sort by term order using the START_TERMS list as reference
         _term_order = {t: i for i, t in enumerate(START_TERMS)}
@@ -885,9 +876,6 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.set_font("Helvetica", "B", 18)
     from fpdf.enums import XPos, YPos
     pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
-    # from fpdf.enums import XPos, YPos
-    # pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_font("Helvetica", "", 11)
     pdf.multi_cell(0, 5, header_text)
