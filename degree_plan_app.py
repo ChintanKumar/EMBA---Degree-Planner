@@ -116,6 +116,12 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
     margin: 1.5rem 0;
 }
 
+.slider-end-label {
+    color: #FAFAFA;
+    font-size: 13px;
+    margin-top: -1.8rem;
+}
+
 /* Chintan - CSS Changes end */
 
     .info-banner {
@@ -200,8 +206,16 @@ st.markdown(
 # Planner API URL - configurable via environment variable
 PLANNER_API_URL = os.environ.get(
     "PLANNER_API_URL",
+PLANNER_API_URL = os.environ.get(
+    "BACKEND_URL",
     "http://localhost:8000/plan"
 )
+
+# Original planner API URL (kept here for reference / fallback if needed)
+# PLANNER_API_URL = (
+#     "http://localhost:8000/plan"
+#     # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
+# )
 
 PROGRAM_CODES = {
     "MS LOD": "MSLOD",
@@ -230,9 +244,13 @@ PACE_LABEL_TO_HALF_TIME = {
 
 # ---------- Vertex AI Conversational Agent (Dialogflow CX) config ----------
 
-DF_PROJECT_ID = "obcc-degree-planner-489404"
-DF_LOCATION_ID = "us"
-DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
+DF_PROJECT_ID = os.environ.get("DF_PROJECT_ID", "obcc-degree-planner-489404")
+DF_LOCATION_ID = os.environ.get("DF_LOCATION_ID", "us-central1")
+DF_AGENT_ID = os.environ.get("DF_AGENT_ID", "1d7f500e-0fbf-4fec-afe0-5f24836dd677")
+
+# DF_PROJECT_ID = "obcc-degree-planner-489404"
+# DF_LOCATION_ID = "us"
+# DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
 DF_AGENT_PATH = (
     f"projects/{DF_PROJECT_ID}/locations/{DF_LOCATION_ID}/agents/{DF_AGENT_ID}"
 )
@@ -600,6 +618,16 @@ if enable_breaks:
         break_terms.append(break2)
 
 # Set flags to control generation vs navigation
+# ------
+
+col_min, col_spacer, col_max = st.sidebar.columns([1, 6, 1])
+with col_min:
+    st.markdown('<div class="slider-end-label">8</div>', unsafe_allow_html=True)
+with col_max:
+    st.markdown('<div class="slider-end-label" style="text-align: right;">25</div>', unsafe_allow_html=True)
+
+# ------
+
 generate = st.sidebar.button("Generate plan", type="primary")
 if generate:
     st.session_state["generate_clicked"] = True
@@ -857,6 +885,9 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.set_font("Helvetica", "B", 18)
     from fpdf.enums import XPos, YPos
     pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
+    # from fpdf.enums import XPos, YPos
+    # pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_font("Helvetica", "", 11)
     pdf.multi_cell(0, 5, header_text)
@@ -909,6 +940,9 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
             x0, y0 = pdf.get_x(), pdf.get_y()
 
             title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
+            # How many lines the title will need
+            title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
+            # title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
             row_height = line_height * len(title_lines)
 
             pdf.set_xy(x0, y0)
@@ -936,6 +970,8 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.ln()
 
     raw = pdf.output()
+    raw = pdf.output(dest="S")
+    # raw = pdf.output()
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
     return raw.encode("latin1")
