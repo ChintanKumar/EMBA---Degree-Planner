@@ -1,3 +1,4 @@
+# Degree Plan
 # ---
 # jupyter:
 #   jupytext:
@@ -13,7 +14,6 @@
 # ---
 
 # %%
-import os
 import requests
 import streamlit as st
 import pandas as pd
@@ -26,10 +26,7 @@ from google.cloud import bigquery
 from google.cloud.dialogflowcx_v3.services.sessions import SessionsClient
 from google.cloud.dialogflowcx_v3.types import session as cx_session
 
-
 # ---------- Page config & global styles ----------
-
-
 
 st.set_page_config(
     page_title="OBCC Degree Planner",
@@ -39,8 +36,6 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-
-    
 
     .stApp {
         background-color: #ffffff;
@@ -115,14 +110,6 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
     margin: 1.5rem 0;
 }
 
-.slider-end-label {
-    color: #FAFAFA;
-    font-size: 13px;
-    margin-top: -1.8rem;
-}
-
-/* Chintan - CSS Changes end */
-
     .info-banner {
         background-color: #f7f7f7;
         border-left: 4px solid #F36F21;
@@ -167,6 +154,27 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
         font-size: 2.2rem;
         font-weight: 700;
     }
+
+    /* Financial aid warning box */
+    .finaid-warning-box {
+        background-color: #fff8e1;
+        border-left: 4px solid #f9a825;
+        padding: 0.75rem 1rem;
+        border-radius: 0.25rem;
+        margin-bottom: 1rem;
+        color: #111111;
+    }
+
+    /* Financial aid success box */
+    .finaid-success-box {
+        background-color: #f0faf4;
+        border-left: 4px solid #00563F;
+        padding: 0.75rem 1rem;
+        border-radius: 0.25rem;
+        margin-bottom: 1rem;
+        color: #111111;
+        font-size: 0.95rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -192,7 +200,7 @@ st.markdown(
     <div class="info-banner">
       <strong>How it works:</strong>
       Use the options on the left to choose your program, start term, pace, and certificates.
-      When you click <em>Generate plan</em>, we’ll build a recommended term-by-term schedule
+      When you click <em>Generate plan</em>, we'll build a recommended term-by-term schedule
       that follows OBCC course offerings and prerequisites. The plan is now generated
       via the OBCC Vertex AI Conversational Agent, which calls the planner tool behind the scenes.
     </div>
@@ -202,16 +210,11 @@ st.markdown(
 
 # ------------------ constants ------------------ #
 
-PLANNER_API_URL = os.environ.get(
-    "BACKEND_URL",
-    "http://localhost:8000/plan"
-)
-
 # Original planner API URL (kept here for reference / fallback if needed)
-# PLANNER_API_URL = (
-#     "http://localhost:8000/plan"
-#     # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
-# )
+PLANNER_API_URL = (
+    "http://localhost:8001/plan"
+    # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
+)
 
 PROGRAM_CODES = {
     "MS LOD": "MSLOD",
@@ -238,48 +241,36 @@ PACE_LABEL_TO_HALF_TIME = {
     "Half-time (<= 8 credits / long term)": True,
 }
 
+# Financial aid minimum credit hours per term (mirrors planner_core.FINAID_MIN_CREDITS)
+FINAID_MIN_CREDITS = {
+    "SP": 5,
+    "FA": 5,
+    "SU": 3,
+}
+
 # ---------- Vertex AI Conversational Agent (Dialogflow CX) config ----------
 
-DF_PROJECT_ID = os.environ.get("DF_PROJECT_ID", "obcc-degree-planner-489404")
-DF_LOCATION_ID = os.environ.get("DF_LOCATION_ID", "us-central1")
-DF_AGENT_ID = os.environ.get("DF_AGENT_ID", "1d7f500e-0fbf-4fec-afe0-5f24836dd677")
-
-# DF_PROJECT_ID = "obcc-degree-planner-489404"
-# DF_LOCATION_ID = "us"
-# DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
+DF_PROJECT_ID = "obcc-degree-planner-489404"
+DF_LOCATION_ID = "us"
+DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
 DF_AGENT_PATH = (
     f"projects/{DF_PROJECT_ID}/locations/{DF_LOCATION_ID}/agents/{DF_AGENT_ID}"
 )
 
-
 def _extract_json_from_text(text: str) -> dict:
-    """
-    Try very hard to extract a dict-like object from the agent's text response.
-
-    Strategy:
-      1. Try json.loads on the full text.
-      2. If that fails, look for the longest {...} block and try json.loads on it.
-      3. If that still fails, try ast.literal_eval on both the full text and the block.
-      4. If that still fails, extract each course row object individually and return
-         {"rows": [...]} built from those.
-    """
     text = text.strip()
 
-    # --- 1) direct JSON ---
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
 
-    # --- 2) extract the biggest {...} block ---
     m = re.search(r"\{.*\}", text, re.DOTALL)
     if m:
         candidate = m.group(0).strip()
-        # 2a) try JSON on that
         try:
             return json.loads(candidate)
         except json.JSONDecodeError:
-            # 2b) try Python-style literal (handles single quotes, trailing commas)
             try:
                 obj = ast.literal_eval(candidate)
                 if isinstance(obj, dict):
@@ -287,7 +278,6 @@ def _extract_json_from_text(text: str) -> dict:
             except Exception:
                 pass
 
-    # --- 3) as a last attempt on the whole text with ast.literal_eval ---
     try:
         obj = ast.literal_eval(text)
         if isinstance(obj, dict):
@@ -295,20 +285,15 @@ def _extract_json_from_text(text: str) -> dict:
     except Exception:
         pass
 
-    # --- 4) Fallback: extract each row object separately ---
     rows: list[dict] = []
 
-    # This regex looks for JSON-like objects that contain "course_number"
-    # and no nested braces (good enough for our planner rows).
     for match in re.finditer(r'\{[^{}]*"course_number"[^{}]*\}', text):
         obj_str = match.group(0)
         parsed = None
 
-        # Try JSON first
         try:
             parsed = json.loads(obj_str)
         except json.JSONDecodeError:
-            # Fall back to ast.literal_eval
             try:
                 parsed = ast.literal_eval(obj_str)
             except Exception:
@@ -318,10 +303,8 @@ def _extract_json_from_text(text: str) -> dict:
             rows.append(parsed)
 
     if rows:
-        # We successfully parsed at least one row object
         return {"rows": rows}
 
-    # If everything failed, raise a detailed error so we can debug
     snippet = text[:600] + ("..." if len(text) > 600 else "")
     raise ValueError(
         "Could not parse JSON from agent response. "
@@ -329,15 +312,7 @@ def _extract_json_from_text(text: str) -> dict:
         + snippet
     )
 
-
 def call_planner_via_agent(payload: dict) -> list[dict]:
-    """
-    Call the OBCC Vertex AI Conversational Agent first (for the project
-    requirement), but use the Cloud Run planner API as the source of truth
-    for the final rows so we never lose courses due to LLM truncation.
-    """
-
-    # ---------- 1) Call the conversational agent ----------
     if "df_session_id" not in st.session_state:
         st.session_state["df_session_id"] = str(uuid.uuid4())
     session_id = st.session_state["df_session_id"]
@@ -370,7 +345,6 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
 
         response = client.detect_intent(request=request)
 
-        # Collect agent text
         parts = []
         for msg in response.query_result.response_messages:
             if msg.text and msg.text.text:
@@ -383,46 +357,38 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
                 agent_text = agent_text[:-3].strip()
 
         if agent_text:
-            # Try to parse whatever the agent returned
             try:
                 data = _extract_json_from_text(agent_text)
                 if "rows" in data and isinstance(data["rows"], list):
                     agent_rows = data["rows"]
             except Exception:
-                # Parsing failures are OK – we'll rely on the planner API below
                 agent_rows = []
 
     except Exception:
-        # Agent call failing should not break the app; we'll rely on the planner API.
         agent_rows = []
 
-    # ---------- 2) Call the Cloud Run planner API (source of truth) ----------
-    planner_rows: list[dict] = []
     try:
         resp = requests.post(PLANNER_API_URL, json=payload, timeout=60)
         resp.raise_for_status()
         data = resp.json()
+        # Multiple plans response — return the whole dict so the caller can handle it
+        if "plans" in data:
+            return data
+        # Single plan response — return the rows list
         planner_rows = data.get("rows", []) or []
+        if planner_rows:
+            return planner_rows
     except Exception as planner_err:
-        # If planner fails, fall back to whatever we got from the agent
         if agent_rows:
             return agent_rows
-        # If neither works, bubble up a clear error
         raise RuntimeError(
             f"Planner API failed after calling the agent: {planner_err}"
         )
 
-    # If the planner returned anything, use it as canonical
-    if planner_rows:
-        return planner_rows
-
-    # Planner returned nothing but agent did – use agent rows as a last resort
     if agent_rows:
         return agent_rows
 
-    # Nothing at all
     raise ValueError("Both the OBCC agent and planner API returned no rows.")
-
 
 # ------------------ BigQuery config for chatbot ------------------ #
 
@@ -430,13 +396,8 @@ PROJECT_ID = "obcc-degree-planner-489404"
 DATASET = "degree_planner_config_data"
 bq_client = bigquery.Client(project=PROJECT_ID)
 
-
 @st.cache_data(show_spinner=False)
 def load_catalog():
-    """
-    Load simple course + offering catalog from BigQuery for the chatbot.
-    Cached so we don't hit BigQuery on every question.
-    """
     courses_query = f"""
         SELECT
           CourseID,
@@ -458,28 +419,18 @@ def load_catalog():
     df_offerings = bq_client.query(offerings_query).to_dataframe()
     return df_courses, df_offerings
 
-
 def _normalize_course_number(raw: str) -> str:
-    """
-    Turn 'ob6374', 'OB6374', 'ob 6374' -> 'OB 6374'
-    """
     raw = raw.strip().upper()
     m = re.match(r"^([A-Z]{2,4})\s*([0-9]{4})$", raw)
     if not m:
         return raw
     return f"{m.group(1)} {m.group(2)}"
 
-
 def answer_course_question(
     question: str,
     df_courses: pd.DataFrame,
     df_offerings: pd.DataFrame,
 ) -> str:
-    """
-    Very simple Q&A:
-    - Find first thing that looks like a course number (e.g. OB 6374)
-    - Return course title, credits, and which terms/sessions it's offered.
-    """
     match = re.search(r"\b[A-Za-z]{2,4}\s*\d{4}\b", question)
     if not match:
         return (
@@ -493,7 +444,6 @@ def answer_course_question(
     raw_code = match.group(0)
     code = _normalize_course_number(raw_code)
 
-    # Look up course info
     row = df_courses[df_courses["CourseNumber"].str.upper() == code].head(1)
     if row.empty:
         return f"I couldn't find a course with number **{code}** in the catalog."
@@ -503,18 +453,12 @@ def answer_course_question(
     credits = int(row["DefaultCreditHours"])
     course_id = int(row["CourseID"])
 
-    # Look up offerings for that course
     offs = df_offerings[df_offerings["CourseID"] == course_id]
     if offs.empty:
         base = f"**{code}** – *{title}* is a {credits}-credit course."
         return base + " I don't see any offerings configured yet in the planner data."
 
-    # Format term + session info
     def _fmt_term(term_code) -> str:
-        """
-        Convert things like 'SP26' → 'Spring 2026'.
-        If the code is missing / malformed, just return it as-is.
-        """
         term_code = str(term_code or "").strip()
         if len(term_code) < 4:
             return term_code or "Unknown term"
@@ -550,49 +494,180 @@ def answer_course_question(
         f"It is currently offered in:\n{offerings_text}"
     )
 
-
 # ------------------ sidebar ------------------ #
+# The sidebar contains all the inputs the user needs to configure their plan.
+# Each input maps to a parameter sent to the /plan API endpoint.
 
 st.sidebar.header("Plan settings")
 
+# Program selection — determines which degree (MS LOD or EMBA HOL)
+# and affects available certificates, default term count, and target credits
 program_label = st.sidebar.selectbox("Program", list(PROGRAM_CODES.keys()))
-start_term_code = st.sidebar.selectbox("Start term", START_TERMS)
+
+# Start term — defaults to the next full term based on current month.
+# Jan-May -> Fall of current year, Jun-Dec -> Spring of next year.
+# Summer is intentionally excluded as a default since it is not a full term.
+from datetime import datetime
+_now = datetime.now()
+_year = _now.year % 100  # e.g. 2026 -> 26
+if _now.month <= 5:
+    _default_start = f"FA{_year:02d}"
+else:
+    _default_start = f"SP{_year + 1:02d}"
+_default_start_idx = START_TERMS.index(_default_start) if _default_start in START_TERMS else 0
+
+start_term_code = st.sidebar.selectbox("Start term", START_TERMS, index=_default_start_idx)
+
+# Certificate selection — filtered by program.
+# EMBA HOL only supports Transformational Leadership (pre-selected).
+# MS LOD supports all 4 certificates.
+if PROGRAM_CODES[program_label] == "HOL-EMBA":
+    available_certs = ["Transformational Leadership"]
+    default_certs = ["Transformational Leadership"]
+else:
+    available_certs = list(CERT_LABEL_TO_CODE.keys())
+    default_certs = []
 
 selected_cert_labels = st.sidebar.multiselect(
     "Certificates",
-    list(CERT_LABEL_TO_CODE.keys()),
-    default=["Organizational Consulting"],
+    available_certs,
+    default=default_certs,
     help="Choose one or more OBCC certificates.",
 )
 
-pace_label = st.sidebar.radio(
-    "Pace",
-    ["Full-time", "Half-time (<= 8 credits / long term)"],
-    index=0,
+# Pace — three mutually exclusive toggles.
+# Turning one on automatically turns the others off via session state.
+# Default is Full-time.
+st.sidebar.markdown(
+    '<p style="color:#FAFAFA; font-size:0.875rem; font-weight:600; margin-bottom:0.25rem;">Pace</p>',
+    unsafe_allow_html=True,
 )
+
+# Initialize pace state if not set
+if "pace_selection" not in st.session_state:
+    st.session_state["pace_selection"] = "full_time"
+
+_pace_full = st.sidebar.toggle(
+    "Full-time",
+    value=st.session_state["pace_selection"] == "full_time",
+    key="toggle_full_time",
+    help="Schedule up to the maximum number of courses per term.",
+)
+_pace_half = st.sidebar.toggle(
+    "Half-time (<= 8 credits / long term)",
+    value=st.session_state["pace_selection"] == "half_time",
+    key="toggle_half_time",
+    help="Cap at 1 course per term regardless of season.",
+)
+_pace_finaid = st.sidebar.toggle(
+    "Financial Aid Eligible pace",
+    value=st.session_state["pace_selection"] == "finaid",
+    key="toggle_finaid",
+    help=(
+        "Flags any term that falls below the minimum credits required for financial aid eligibility: "
+        "5+ SCH in Fall/Spring, 3+ SCH in Summer. "
+        "A warning will appear below the plan if any term does not meet the minimum."
+    ),
+)
+
+# Mutual exclusion: whichever toggle changed to True wins.
+# If none are on (user toggled the active one off), default back to Full-time.
+if _pace_finaid and st.session_state["pace_selection"] != "finaid":
+    st.session_state["pace_selection"] = "finaid"
+    st.rerun()
+elif _pace_half and st.session_state["pace_selection"] != "half_time":
+    st.session_state["pace_selection"] = "half_time"
+    st.rerun()
+elif _pace_full and st.session_state["pace_selection"] != "full_time":
+    st.session_state["pace_selection"] = "full_time"
+    st.rerun()
+elif not _pace_full and not _pace_half and not _pace_finaid:
+    # All toggled off — snap back to full-time
+    st.session_state["pace_selection"] = "full_time"
+    st.rerun()
+
+# Derive the individual flags used downstream from the single pace_selection value
+_active_pace = st.session_state["pace_selection"]
+pace_label = (
+    "Full-time" if _active_pace == "full_time"
+    else "Half-time (<= 8 credits / long term)"
+)
+half_time = _active_pace == "half_time"
+finaid = _active_pace == "finaid"
+
+# Term slider — controls how many terms the plan is spread across.
+# Default is 6 for MS LOD and SHR, 7 for EMBA HOL.
+# Higher values produce lighter-load plans spread across more semesters.
+selected_cert_codes = [CERT_LABEL_TO_CODE[l] for l in selected_cert_labels]
+_default_terms = 7 if PROGRAM_CODES[program_label] == "HOL-EMBA" else 6
 
 max_terms = st.sidebar.slider(
     "Maximum number of terms",
-    min_value=8,
-    max_value=25,      # increased from 16 to 25
-    value=12,
+    min_value=6,
+    max_value=12,
+    value=_default_terms,
 )
 
-# ------
+# Plan versions — generates multiple slightly different plans.
+# Variations differ in which electives fill the remaining slots
+# and which terms optional courses land in.
+num_plans = st.sidebar.slider(
+    "Number of plan versions",
+    min_value=1,
+    max_value=3,
+    value=1,
+    help="Generate multiple variations of the degree plan.",
+)
 
-col_min, col_spacer, col_max = st.sidebar.columns([1, 6, 1])
-with col_min:
-    st.markdown('<div class="slider-end-label">8</div>', unsafe_allow_html=True)
-with col_max:
-    st.markdown('<div class="slider-end-label" style="text-align: right;">25</div>', unsafe_allow_html=True)
+# Summer toggle — when off, Summer terms are completely skipped.
+# Courses that are Summer-only will still be included but moved to
+# the nearest available Fall or Spring term.
+include_summer = st.sidebar.toggle(
+    "Include Summer terms",
+    value=True,
+    help="When off, Summer terms are skipped and courses spread across Spring and Fall only.",
+)
 
-# ------
+# Breaks section — allows students to mark semesters they won't be enrolled
+st.sidebar.markdown("---")
+enable_breaks = st.sidebar.toggle(
+    "Add semester breaks",
+    value=False,
+    help="Enable if the student needs to skip one or more semesters.",
+)
 
+break_terms = []
+if enable_breaks:
+    # Only show SP and FA terms as break options (Summer is already optional)
+    break_term_options = [t for t in START_TERMS if not t.startswith("SU")]
+    break1 = st.sidebar.selectbox(
+        "Break semester 1",
+        ["None"] + break_term_options,
+        index=0,
+    )
+    if break1 != "None":
+        break_terms.append(break1)
+
+    break2 = st.sidebar.selectbox(
+        "Break semester 2",
+        ["None"] + [t for t in break_term_options if t != break1],
+        index=0,
+    )
+    if break2 != "None":
+        break_terms.append(break2)
+
+# FIX 1: Reset plan_generated flag whenever Generate plan is clicked.
+# This ensures the generation block runs even after a previous run,
+# and prevents navigation button clicks from re-triggering generation.
 generate = st.sidebar.button("Generate plan", type="primary")
+if generate:
+    st.session_state["plan_generated"] = False
 
 # ------------------ main layout ------------------ #
+# This section handles plan generation and display.
+# Plans are stored in st.session_state so navigation between
+# versions works without regenerating the plan.
 
-# st.subheader("Generated degree plan")
 st.markdown(
     '<h3 class="section-subheader">Generated degree plan</h3>',
     unsafe_allow_html=True,
@@ -601,8 +676,7 @@ st.markdown(
 df = None
 cert_codes: list[str] = []
 
-if not generate:
-    # st.info("Configure your plan options in the sidebar and click **Generate plan**.")
+if not generate and "all_plans" not in st.session_state:
     st.markdown(
     """
     <div class="custom-info-box">
@@ -611,19 +685,26 @@ if not generate:
     """,
     unsafe_allow_html=True,
 )
-else:
+# FIX 2: Use elif (not else) so this block is skipped when navigating between plans.
+# The plan_generated flag is False only right after Generate is clicked,
+# so navigation button clicks (which set plan_index and rerun) skip this block entirely.
+elif not st.session_state.get("plan_generated", False):
     # Map UI labels -> API codes
     program_code = PROGRAM_CODES[program_label]
     cert_codes = [CERT_LABEL_TO_CODE[label] for label in selected_cert_labels]
-    half_time = PACE_LABEL_TO_HALF_TIME[pace_label]
+    # half_time and finaid are derived from the mutually exclusive pace toggles above
 
-    # Build the payload we want the agent's planner tool to use
+    # Build the payload — finaid is passed through to the planner
     payload = {
         "program_code": program_code,
         "start_term_code": start_term_code,
         "half_time": half_time,
+        "finaid": finaid,
         "certs": cert_codes,
         "max_terms": max_terms,
+        "num_plans": num_plans,
+        "include_summer": include_summer,
+        "break_terms": break_terms,
     }
 
     try:
@@ -636,49 +717,177 @@ else:
                 "Check your agent tool configuration or planner logic."
             )
         else:
-            df = pd.DataFrame(rows)
+            # Handle multiple plans response
+            if isinstance(rows, dict) and "plans" in rows:
+                all_plans = rows["plans"]
+            else:
+                # Single plan or already-extracted rows
+                all_plans = [{"variation": 1, "rows": rows if isinstance(rows, list) else rows.get("rows", []), "finaid_warnings": []}]
 
-            st.markdown(
-                f"Plan generated for **{program_label}**, starting **{start_term_code}**, "
-                f"Pace: **{pace_label.split()[0]}**, "
-                f"Certificates: **{', '.join(cert_codes) if cert_codes else 'None'}**."
-            )
+            # FIX 3: Mark generation complete BEFORE storing plans in session state.
+            # This is the critical flag that prevents re-generation on navigation reruns.
+            st.session_state["plan_generated"] = True
 
-            st.dataframe(df, use_container_width=True)
-
-            total_hours = df["credits"].sum() if "credits" in df.columns else None
-            total_tuition = df["tuition"].sum() if "tuition" in df.columns else None
-
-            col1, col2 = st.columns(2)
-
-            with col1:
-                if total_hours is not None:
-                    st.markdown(
-                        f"""
-                        <div class="summary-metric-label">Total credits</div>
-                        <div class="summary-metric-value">{int(total_hours)}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
-
-            with col2:
-                if total_tuition is not None:
-                    st.markdown(
-                        f"""
-                        <div class="summary-metric-label">Total tuition (estimate)</div>
-                        <div class="summary-metric-value">${int(total_tuition):,}</div>
-                        """,
-                        unsafe_allow_html=True,
-                    )
+            # Store plans in session state
+            st.session_state["all_plans"] = all_plans
+            st.session_state["plan_index"] = 0
+            st.session_state["plan_meta"] = {
+                "program_label": program_label,
+                "start_term_code": start_term_code,
+                "pace_label": pace_label,
+                "cert_codes": cert_codes,
+                "max_terms": max_terms,
+                "include_summer": include_summer,
+                "break_terms": break_terms,
+                "finaid": finaid,
+            }
 
     except Exception as e:
-        # If something goes wrong with the agent, show a clear error
         st.error(
             "Error calling OBCC Vertex AI conversational agent for planning:\n"
             f"{e}"
         )
 
-# st.caption("Tuition estimates are approximate and subject to change.")
+# Display plans from session state
+if "all_plans" in st.session_state and st.session_state["all_plans"]:
+    all_plans = st.session_state["all_plans"]
+    plan_index = st.session_state.get("plan_index", 0)
+    meta = st.session_state.get("plan_meta", {})
+
+    current_plan = all_plans[plan_index]
+    current_rows = current_plan.get("rows", [])
+    total_plans = len(all_plans)
+    
+    # Check if all plans are identical — only relevant when multiple versions requested
+    all_rows = [json.dumps(p.get("rows", []), sort_keys=True) for p in all_plans]
+    plans_are_identical = len(set(all_rows)) == 1
+
+    # Navigation header — only show if multiple plans AND they differ
+    if total_plans > 1 and not plans_are_identical:
+        nav_col1, nav_col2, nav_col3 = st.columns([1, 2, 1])
+        with nav_col1:
+            if st.button("← Previous", disabled=(plan_index == 0)):
+                st.session_state["plan_index"] = plan_index - 1
+                st.rerun()
+        with nav_col2:
+            st.markdown(
+                f"<div style='text-align:center; padding-top:0.4rem; font-weight:600;'>Plan {plan_index + 1} of {total_plans}</div>",
+                unsafe_allow_html=True,
+            )
+        with nav_col3:
+            if st.button("Next →", disabled=(plan_index == total_plans - 1)):
+                st.session_state["plan_index"] = plan_index + 1
+                st.rerun()
+
+    elif total_plans > 1 and plans_are_identical:
+        st.markdown(
+            """
+            <div class="custom-info-box">
+                Only one unique plan could be generated for this program and certificate combination — all required courses have fixed scheduling with no room for variation.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        f"Plan generated for **{meta.get('program_label', '')}**, "
+        f"starting **{meta.get('start_term_code', '')}**, "
+        f"Pace: **{meta.get('pace_label', '').split()[0]}**, "
+        f"Certificates: **{', '.join(meta.get('cert_codes', [])) if meta.get('cert_codes') else 'None'}**."
+    )
+
+    # Add break term rows to the display dataframe
+    # Break terms show as a single row with "SEMESTER BREAK" in the course title
+    _meta_breaks = meta.get("break_terms", [])
+    _break_rows = []
+    for bt in _meta_breaks:
+        _break_rows.append({
+            "term": bt,
+            "course_number": "—",
+            "course_title": "⏸ Semester Break",
+            "credits": 0,
+            "session": "—",
+            "tuition": 0,
+        })
+
+    if _break_rows:
+        _break_df = pd.DataFrame(_break_rows)
+        _all_rows = current_rows + _break_rows
+        # Re-sort by term order using the START_TERMS list as reference
+        _term_order = {t: i for i, t in enumerate(START_TERMS)}
+        _all_rows.sort(key=lambda r: _term_order.get(r["term"], 999))
+        df = pd.DataFrame(_all_rows)
+    else:
+        df = pd.DataFrame(current_rows)
+
+    st.dataframe(df, use_container_width=True)
+
+    total_hours = df["credits"].sum() if "credits" in df.columns else None
+    total_tuition = df["tuition"].sum() if "tuition" in df.columns else None
+    # Count only actual course terms (exclude break rows)
+    total_terms = len(set(r["term"] for r in current_rows)) if current_rows else None
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        if total_hours is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total credits</div>
+                <div class="summary-metric-value">{int(total_hours)}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with col2:
+        if total_terms is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total semesters</div>
+                <div class="summary-metric-value">{total_terms}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with col3:
+        if total_tuition is not None:
+            st.markdown(
+                f"""
+                <div class="summary-metric-label">Total tuition (estimate)</div>
+                <div class="summary-metric-value">${int(total_tuition):,}</div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Financial aid warnings — shown only when the finaid toggle was on
+    # and the current plan has terms that fall below the minimum credit thresholds.
+    if meta.get("finaid"):
+        finaid_warnings = current_plan.get("finaid_warnings", [])
+        if finaid_warnings:
+            warning_lines = "<br>".join(f"⚠️ {w}" for w in finaid_warnings)
+            st.markdown(
+                f"""
+                <div class="finaid-warning-box">
+                    <strong>Financial Aid Eligibility Warning</strong><br>
+                    The following terms may not meet the minimum credit hours required for financial aid eligibility.
+                    Consider adjusting the plan or speaking with a financial aid advisor.<br><br>
+                    {warning_lines}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div class="finaid-success-box">
+                    ✅ <strong>Financial Aid Eligible</strong> &mdash;
+                    All terms meet the minimum credit requirements
+                    (5+ SCH in Fall/Spring, 3+ SCH in Summer).
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
 st.markdown(
     """
     <div class="custom-caption">
@@ -689,10 +898,12 @@ st.markdown(
 )
 
 # ------------- PDF download ------------- #
-
+# Generates a formatted PDF of the currently displayed plan.
+# The PDF includes the plan header, a term-by-term course table,
+# and a totals row with total credits and tuition estimate.
 
 def _format_term_label(term_code: str) -> str:
-    """Convert 'SP26' → 'Spring 2026', 'FA27' → 'Fall 2027' etc."""
+    """Convert 'SP26' -> 'Spring 2026', 'FA27' -> 'Fall 2027' etc."""
     if not term_code or len(term_code) < 4:
         return term_code
     season_code = term_code[:2]
@@ -702,14 +913,9 @@ def _format_term_label(term_code: str) -> str:
     year = 2000 + int(year_code)
     return f"{season} {year}"
 
-
 def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
-    # Make a copy so we don't mutate the original
     df_local = plan_df.copy()
 
-    # --- Normalize the term column name ---
-    # The planner originally used "term", but the agent/tool might return
-    # something like "Term", "term_code", or "TermCode".
     term_col = None
     for cand in ["term", "Term", "term_code", "TermCode"]:
         if cand in df_local.columns:
@@ -722,37 +928,30 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
             f"Available columns: {list(df_local.columns)}"
         )
 
-    # Rename the detected term column to "term" so the rest of the code works
     if term_col != "term":
         df_local = df_local.rename(columns={term_col: "term"})
 
-    # Portrait letter, mm units
     pdf = FPDF(orientation="P", unit="mm", format="Letter")
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
 
-    # ----- Title -----
     pdf.set_font("Helvetica", "B", 18)
-    pdf.cell(0, 10, "OBCC Degree Plan", ln=1)
-    # from fpdf.enums import XPos, YPos
-    # pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    from fpdf.enums import XPos, YPos
+    pdf.cell(0, 10, "OBCC Degree Plan", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-    # ----- Program info block -----
     pdf.set_font("Helvetica", "", 11)
     pdf.multi_cell(0, 5, header_text)
     pdf.ln(3)
 
-    # Column layout (in mm)
     col_course = 25
     col_title = 80
     col_credits = 15
     col_session = 35
     col_tuition = 30
 
-    # Helper to draw table header for each term section
     def draw_table_header():
         pdf.set_font("Helvetica", "B", 10)
-        pdf.set_fill_color(230, 230, 230)  # light gray
+        pdf.set_fill_color(230, 230, 230)
         pdf.cell(col_course, 7, "Course", border=1, align="L", fill=True)
         pdf.cell(col_title, 7, "Course Title", border=1, align="L", fill=True)
         pdf.cell(col_credits, 7, "Hours", border=1, align="C", fill=True)
@@ -763,24 +962,20 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     total_credits = 0
     total_tuition_val = 0
 
-    # Keep the original planner term order
     ordered_terms = list(dict.fromkeys(df_local["term"].tolist()))
 
     for term_code in ordered_terms:
         group = df_local[df_local["term"] == term_code]
 
-        # Term header bar, e.g. "Spring 2026"
         term_label = _format_term_label(term_code)
         pdf.set_font("Helvetica", "B", 12)
-        pdf.set_fill_color(255, 230, 150)  # soft yellow
+        pdf.set_fill_color(255, 230, 150)
         pdf.cell(0, 8, term_label, ln=1, fill=True)
 
-        # Table header for this term
         draw_table_header()
 
-        # Table rows with wrapped titles
         pdf.set_font("Helvetica", "", 10)
-        line_height = 5  # mm
+        line_height = 5
 
         for _, row in group.iterrows():
             course = str(row["course_number"])
@@ -794,33 +989,25 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
 
             x0, y0 = pdf.get_x(), pdf.get_y()
 
-            # How many lines the title will need
-            title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
-            # title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
+            title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
             row_height = line_height * len(title_lines)
 
-            # Course column
             pdf.set_xy(x0, y0)
             pdf.cell(col_course, row_height, course, border=1, align="L")
 
-            # Title column (wrapped)
             pdf.set_xy(x0 + col_course, y0)
             pdf.multi_cell(col_title, line_height, title, border=1, align="L")
 
-            # Move to top-right of the row
             pdf.set_xy(x0 + col_course + col_title, y0)
 
-            # Hours, Session, Tuition
             pdf.cell(col_credits, row_height, str(credits), border=1, align="C")
             pdf.cell(col_session, row_height, session, border=1, align="L")
             pdf.cell(col_tuition, row_height, f"${tuition:,.0f}", border=1, align="R")
 
-            # Next row
             pdf.set_xy(x0, y0 + row_height)
 
         pdf.ln(3)
 
-    # Totals bar
     pdf.set_font("Helvetica", "B", 11)
     pdf.set_fill_color(255, 230, 150)
     pdf.cell(col_course + col_title, 8, "TOTALS", border=1, align="R", fill=True)
@@ -829,45 +1016,60 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.cell(col_tuition, 8, f"${total_tuition_val:,.0f}", border=1, align="R", fill=True)
     pdf.ln()
 
-    raw = pdf.output(dest="S")
-    # raw = pdf.output()
+    raw = pdf.output()
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
     return raw.encode("latin1")
 
-
-# Only show PDF button when we have a plan
 if df is not None:
+    meta = st.session_state.get("plan_meta", {})
+    plan_index = st.session_state.get("plan_index", 0)
+    pace_label_pdf = meta.get("pace_label", "")
+    cert_codes_pdf = meta.get("cert_codes", [])
+    max_terms_pdf = meta.get("max_terms", 6)
+    program_label_pdf = meta.get("program_label", "")
+    start_term_code_pdf = meta.get("start_term_code", "")
+    total_plans = len(st.session_state.get("all_plans", []))
+
     pace_for_pdf = (
-        pace_label
-        .replace("≤", "<=")
-        .replace("–", "-")
+        pace_label_pdf
+        .replace("\u2264", "<=")
+        .replace("\u2013", "-")
     )
+
+    plan_label = f" (Version {plan_index + 1} of {total_plans})" if total_plans > 1 else ""
+    breaks_pdf = meta.get("break_terms", [])
+    breaks_label = f"\nBreaks: {', '.join(breaks_pdf)}" if breaks_pdf else ""
+    finaid_label = "\nFinancial Aid Eligible pace: Yes" if meta.get("finaid") else ""
 
     header_txt = (
-        f"Program: {program_label}\n"
-        f"Start term: {start_term_code}\n"
+        f"Program: {program_label_pdf}{plan_label}\n"
+        f"Start term: {start_term_code_pdf}\n"
         f"Pace: {pace_for_pdf}\n"
-        f"Certificates: {', '.join(cert_codes) if cert_codes else 'None'}\n"
-        f"Max terms: {max_terms}"
+        f"Certificates: {', '.join(cert_codes_pdf) if cert_codes_pdf else 'None'}\n"
+        f"Max terms: {max_terms_pdf}"
+        f"{breaks_label}"
+        f"{finaid_label}"
     )
 
-    pdf_bytes = make_pdf(df, header_txt)
+    # Filter out break rows before generating PDF (break rows have 0 credits)
+    df_pdf = df[df["course_number"] != "—"].copy() if df is not None else df
+    pdf_bytes = make_pdf(df_pdf, header_txt)
 
     st.download_button(
-        "Download degree plan as PDF",
+        f"Download degree plan as PDF",
         data=pdf_bytes,
-        file_name="obcc_degree_plan.pdf",
+        file_name=f"obcc_degree_plan_v{plan_index + 1}.pdf",
         mime="application/pdf",
     )
 
 # ------------- OBCC Course Assistant (simple Q&A at bottom) ------------- #
+# Simple course lookup tool. The user types a course number (e.g. "OB 6374")
+# and the assistant returns the course name, credits, and when it is offered.
+# Uses cached BigQuery data to avoid repeated API calls.
 
-# st.markdown("---")
 st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
 
-
-# st.subheader("Ask the OBCC Course Assistant")
 st.markdown(
     '<h3 class="section-subheader">Ask the OBCC Course Assistant</h3>',
     unsafe_allow_html=True,
@@ -878,9 +1080,6 @@ st.write(
     "credits, and when it's offered. For example: "
     "`What is OB 6374?` or `When is OB 6334 offered?`"
 )
-
-# Load catalog once (cached)
-#df_courses, df_offerings = load_catalog()
 
 question = st.text_input("Type your question about a course...")
 
