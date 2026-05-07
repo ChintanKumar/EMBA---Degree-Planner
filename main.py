@@ -1,19 +1,3 @@
-#Main
-# ---
-# jupyter:
-#   jupytext:
-#     text_representation:
-#       extension: .py
-#       format_name: percent
-#       format_version: '1.3'
-#       jupytext_version: 1.18.1
-#   kernelspec:
-#     display_name: Python 3 (ipykernel) (Local)
-#     language: python
-#     name: conda-base-py
-# ---
-
-# %%
 # main.py
 # -------
 # FastAPI backend for the OBCC Degree Planner.
@@ -30,7 +14,6 @@ import planner_core as pc
 
 app = FastAPI()
 
-
 class DegreePlannerRequest(BaseModel):
     """
     Defines the expected JSON body for the /plan endpoint.
@@ -41,20 +24,19 @@ class DegreePlannerRequest(BaseModel):
     start_term_code: str                 # e.g. "SP26" — first term of the plan
     certs: Optional[List[str]] = None    # certificate codes e.g. ["OC", "TL"]
     half_time: bool = False              # if True, max 1 course per term
-    fin_aid: bool = False                # if True, min 2 courses SP/FA, min 1 Summer
+    finaid: bool = False                 # if True, enforce financial aid minimum credits per term
+                                         # (>= 5 SCH for Fall/Spring, >= 3 SCH for Summer)
     max_terms: int = 20                  # target number of terms to spread courses across
     target_credits: Optional[int] = None # override total credits (defaults by program)
     return_rows: bool = True             # if True, return flat row list for the UI table
     num_plans: int = 1                   # number of plan variations to generate (max 3)
-    include_summer: bool = True
+    include_summer: bool = True          # if False, Summer terms are skipped entirely
     break_terms: list = []               # term codes where student takes a break e.g. ["FA26"]
-
 
 @app.get("/")
 def health_check():
     """Simple health check endpoint — returns ok if the server is running."""
     return {"status": "ok"}
-
 
 @app.post("/plan")
 def generate_plan(body: DegreePlannerRequest):
@@ -82,9 +64,9 @@ def generate_plan(body: DegreePlannerRequest):
     certs = body.certs or []
     num_plans = max(1, min(body.num_plans, 3))  # safety cap at 3 variations
 
-    # Generate each plan variation
-    # variation=0 is the default/baseline plan
-    # variation=1,2 use different random seeds for elective ordering
+    # Generate each plan variation.
+    # variation=0 is the default/baseline plan.
+    # variation=1,2 use different random seeds for elective ordering.
     all_plans = []
     for i in range(num_plans):
         plan = pc.run_planner(
@@ -92,7 +74,7 @@ def generate_plan(body: DegreePlannerRequest):
             start_term_code=body.start_term_code,
             certs=certs,
             half_time=body.half_time,
-            fin_aid=body.fin_aid,
+            finaid=body.finaid,
             max_terms=body.max_terms,
             target_credits=target,
             variation=i,
@@ -113,7 +95,8 @@ def generate_plan(body: DegreePlannerRequest):
                 "certificates": plan["certificates"],
                 "start_term_code": plan["start_term_code"],
                 "half_time": plan["half_time"],
-                "fin_aid": plan["fin_aid"],
+                "finaid": plan["finaid"],
+                "finaid_warnings": plan.get("finaid_warnings", []),
                 "include_summer": plan["include_summer"],
                 "break_terms": plan.get("break_terms", []),
                 "total_credits": plan["total_credits"],
@@ -126,8 +109,8 @@ def generate_plan(body: DegreePlannerRequest):
             plan["variation"] = i + 1
             all_plans.append(plan)
 
-    # For single plan requests, return the plan directly (backwards compatible)
-    # For multiple plans, wrap in a {"plans": [...]} dict
+    # For single plan requests, return the plan directly (backwards compatible).
+    # For multiple plans, wrap in a {"plans": [...]} dict.
     if num_plans == 1:
         return all_plans[0]
 

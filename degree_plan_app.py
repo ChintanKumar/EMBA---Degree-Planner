@@ -14,7 +14,6 @@
 # ---
 
 # %%
-import os
 import requests
 import streamlit as st
 import pandas as pd
@@ -22,15 +21,12 @@ from fpdf import FPDF
 import re
 import json
 import uuid
-import ast
+import ast 
 from google.cloud import bigquery
 from google.cloud.dialogflowcx_v3.services.sessions import SessionsClient
 from google.cloud.dialogflowcx_v3.types import session as cx_session
 
-
 # ---------- Page config & global styles ----------
-
-
 
 st.set_page_config(
     page_title="OBCC Degree Planner",
@@ -40,8 +36,6 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-
-    
 
     .stApp {
         background-color: #ffffff;
@@ -116,14 +110,6 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
     margin: 1.5rem 0;
 }
 
-.slider-end-label {
-    color: #FAFAFA;
-    font-size: 13px;
-    margin-top: -1.8rem;
-}
-
-/* Chintan - CSS Changes end */
-
     .info-banner {
         background-color: #f7f7f7;
         border-left: 4px solid #F36F21;
@@ -168,6 +154,27 @@ section[data-testid="stSidebar"] div[data-testid="stSlider"] div[data-testid="st
         font-size: 2.2rem;
         font-weight: 700;
     }
+
+    /* Financial aid warning box */
+    .finaid-warning-box {
+        background-color: #fff8e1;
+        border-left: 4px solid #f9a825;
+        padding: 0.75rem 1rem;
+        border-radius: 0.25rem;
+        margin-bottom: 1rem;
+        color: #111111;
+    }
+
+    /* Financial aid success box */
+    .finaid-success-box {
+        background-color: #f0faf4;
+        border-left: 4px solid #00563F;
+        padding: 0.75rem 1rem;
+        border-radius: 0.25rem;
+        margin-bottom: 1rem;
+        color: #111111;
+        font-size: 0.95rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -203,10 +210,10 @@ st.markdown(
 
 # ------------------ constants ------------------ #
 
-# Planner API URL - configurable via environment variable
-PLANNER_API_URL = os.environ.get(
-    "PLANNER_API_URL",
-    "http://localhost:8000/plan"
+# Original planner API URL (kept here for reference / fallback if needed)
+PLANNER_API_URL = (
+    "http://localhost:8001/plan"
+    # "https://degree-planner-service-862821094277.us-central1.run.app/plan"
 )
 
 PROGRAM_CODES = {
@@ -234,19 +241,21 @@ PACE_LABEL_TO_HALF_TIME = {
     "Half-time (<= 8 credits / long term)": True,
 }
 
+# Financial aid minimum credit hours per term (mirrors planner_core.FINAID_MIN_CREDITS)
+FINAID_MIN_CREDITS = {
+    "SP": 5,
+    "FA": 5,
+    "SU": 3,
+}
+
 # ---------- Vertex AI Conversational Agent (Dialogflow CX) config ----------
 
-DF_PROJECT_ID = os.environ.get("DF_PROJECT_ID", "obcc-degree-planner-489404")
-DF_LOCATION_ID = os.environ.get("DF_LOCATION_ID", "us-central1")
-DF_AGENT_ID = os.environ.get("DF_AGENT_ID", "1d7f500e-0fbf-4fec-afe0-5f24836dd677")
-
-# DF_PROJECT_ID = "obcc-degree-planner-489404"
-# DF_LOCATION_ID = "us"
-# DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
+DF_PROJECT_ID = "obcc-degree-planner-489404"
+DF_LOCATION_ID = "us"
+DF_AGENT_ID = "1d7f500e-0fbf-4fec-afe0-5f24836dd677"  # your agent ID
 DF_AGENT_PATH = (
     f"projects/{DF_PROJECT_ID}/locations/{DF_LOCATION_ID}/agents/{DF_AGENT_ID}"
 )
-
 
 def _extract_json_from_text(text: str) -> dict:
     text = text.strip()
@@ -302,7 +311,6 @@ def _extract_json_from_text(text: str) -> dict:
         "Here is the beginning of the response:\n"
         + snippet
     )
-
 
 def call_planner_via_agent(payload: dict) -> list[dict]:
     if "df_session_id" not in st.session_state:
@@ -382,13 +390,11 @@ def call_planner_via_agent(payload: dict) -> list[dict]:
 
     raise ValueError("Both the OBCC agent and planner API returned no rows.")
 
-
 # ------------------ BigQuery config for chatbot ------------------ #
 
 PROJECT_ID = "obcc-degree-planner-489404"
 DATASET = "degree_planner_config_data"
 bq_client = bigquery.Client(project=PROJECT_ID)
-
 
 @st.cache_data(show_spinner=False)
 def load_catalog():
@@ -413,14 +419,12 @@ def load_catalog():
     df_offerings = bq_client.query(offerings_query).to_dataframe()
     return df_courses, df_offerings
 
-
 def _normalize_course_number(raw: str) -> str:
     raw = raw.strip().upper()
     m = re.match(r"^([A-Z]{2,4})\s*([0-9]{4})$", raw)
     if not m:
         return raw
     return f"{m.group(1)} {m.group(2)}"
-
 
 def answer_course_question(
     question: str,
@@ -490,7 +494,6 @@ def answer_course_question(
         f"It is currently offered in:\n{offerings_text}"
     )
 
-
 # ------------------ sidebar ------------------ #
 # The sidebar contains all the inputs the user needs to configure their plan.
 # Each input maps to a parameter sent to the /plan API endpoint.
@@ -500,6 +503,7 @@ st.sidebar.header("Plan settings")
 # Program selection — determines which degree (MS LOD or EMBA HOL)
 # and affects available certificates, default term count, and target credits
 program_label = st.sidebar.selectbox("Program", list(PROGRAM_CODES.keys()))
+
 # Start term — defaults to the next full term based on current month.
 # Jan-May -> Fall of current year, Jun-Dec -> Spring of next year.
 # Summer is intentionally excluded as a default since it is not a full term.
@@ -531,33 +535,76 @@ selected_cert_labels = st.sidebar.multiselect(
     help="Choose one or more OBCC certificates.",
 )
 
-# Show info message when SHR is selected
-if "Strategic Human Resources" in selected_cert_labels:
-    st.sidebar.info(
-        "ℹ️ Plans with the SHR certificate typically require 7 terms due to "
-        "Fall-only course scheduling constraints."
-    )
-
-# Pace — full-time allows up to the dynamic max courses per term.
-# Half-time caps at 1 course per term regardless of season.
-# Financial Aid Eligible enforces minimum credits per term.
-pace_label = st.sidebar.selectbox(
-    "Pace",
-    ["Full-time", "Half-time (<= 8 credits / long term)", "Financial Aid Eligible"],
-    index=0,
-    help="Financial Aid Eligible pacing ensures every term meets minimum credit requirements: Fall/Spring ≥ 5 SCH, Summer ≥ 3 SCH",
+# Pace — three mutually exclusive toggles.
+# Turning one on automatically turns the others off via session state.
+# Default is Full-time.
+st.sidebar.markdown(
+    '<p style="color:#FAFAFA; font-size:0.875rem; font-weight:600; margin-bottom:0.25rem;">Pace</p>',
+    unsafe_allow_html=True,
 )
 
+# Initialize pace state if not set
+if "pace_selection" not in st.session_state:
+    st.session_state["pace_selection"] = "full_time"
+
+_pace_full = st.sidebar.toggle(
+    "Full-time",
+    value=st.session_state["pace_selection"] == "full_time",
+    key="toggle_full_time",
+    help="Schedule up to the maximum number of courses per term.",
+)
+_pace_half = st.sidebar.toggle(
+    "Half-time (<= 8 credits / long term)",
+    value=st.session_state["pace_selection"] == "half_time",
+    key="toggle_half_time",
+    help="Cap at 1 course per term regardless of season.",
+)
+_pace_finaid = st.sidebar.toggle(
+    "Financial Aid Eligible pace",
+    value=st.session_state["pace_selection"] == "finaid",
+    key="toggle_finaid",
+    help=(
+        "Flags any term that falls below the minimum credits required for financial aid eligibility: "
+        "5+ SCH in Fall/Spring, 3+ SCH in Summer. "
+        "A warning will appear below the plan if any term does not meet the minimum."
+    ),
+)
+
+# Mutual exclusion: whichever toggle changed to True wins.
+# If none are on (user toggled the active one off), default back to Full-time.
+if _pace_finaid and st.session_state["pace_selection"] != "finaid":
+    st.session_state["pace_selection"] = "finaid"
+    st.rerun()
+elif _pace_half and st.session_state["pace_selection"] != "half_time":
+    st.session_state["pace_selection"] = "half_time"
+    st.rerun()
+elif _pace_full and st.session_state["pace_selection"] != "full_time":
+    st.session_state["pace_selection"] = "full_time"
+    st.rerun()
+elif not _pace_full and not _pace_half and not _pace_finaid:
+    # All toggled off — snap back to full-time
+    st.session_state["pace_selection"] = "full_time"
+    st.rerun()
+
+# Derive the individual flags used downstream from the single pace_selection value
+_active_pace = st.session_state["pace_selection"]
+pace_label = (
+    "Full-time" if _active_pace == "full_time"
+    else "Half-time (<= 8 credits / long term)"
+)
+half_time = _active_pace == "half_time"
+finaid = _active_pace == "finaid"
+
 # Term slider — controls how many terms the plan is spread across.
-# Default is 6 for MS LOD, 7 for EMBA HOL and SHR (which need more terms).
+# Default is 6 for MS LOD and SHR, 7 for EMBA HOL.
 # Higher values produce lighter-load plans spread across more semesters.
 selected_cert_codes = [CERT_LABEL_TO_CODE[l] for l in selected_cert_labels]
-_default_terms = 7 if PROGRAM_CODES[program_label] == "HOL-EMBA" or "SHR" in selected_cert_codes else 6
+_default_terms = 7 if PROGRAM_CODES[program_label] == "HOL-EMBA" else 6
 
 max_terms = st.sidebar.slider(
     "Maximum number of terms",
     min_value=6,
-    max_value=25,
+    max_value=12,
     value=_default_terms,
 )
 
@@ -609,21 +656,12 @@ if enable_breaks:
     if break2 != "None":
         break_terms.append(break2)
 
-# Set flags to control generation vs navigation
-# ------
-
-col_min, col_spacer, col_max = st.sidebar.columns([1, 6, 1])
-with col_min:
-    st.markdown('<div class="slider-end-label">8</div>', unsafe_allow_html=True)
-with col_max:
-    st.markdown('<div class="slider-end-label" style="text-align: right;">25</div>', unsafe_allow_html=True)
-
-# ------
-
+# FIX 1: Reset plan_generated flag whenever Generate plan is clicked.
+# This ensures the generation block runs even after a previous run,
+# and prevents navigation button clicks from re-triggering generation.
 generate = st.sidebar.button("Generate plan", type="primary")
 if generate:
-    st.session_state["generate_clicked"] = True
-    st.session_state["plans_loaded"] = False
+    st.session_state["plan_generated"] = False
 
 # ------------------ main layout ------------------ #
 # This section handles plan generation and display.
@@ -647,31 +685,26 @@ if not generate and "all_plans" not in st.session_state:
     """,
     unsafe_allow_html=True,
 )
-# Only run generation if Generate button was clicked and plans haven't been loaded yet
-elif st.session_state.get("generate_clicked", False) and not st.session_state.get("plans_loaded", False):
+# FIX 2: Use elif (not else) so this block is skipped when navigating between plans.
+# The plan_generated flag is False only right after Generate is clicked,
+# so navigation button clicks (which set plan_index and rerun) skip this block entirely.
+elif not st.session_state.get("plan_generated", False):
     # Map UI labels -> API codes
     program_code = PROGRAM_CODES[program_label]
     cert_codes = [CERT_LABEL_TO_CODE[label] for label in selected_cert_labels]
+    # half_time and finaid are derived from the mutually exclusive pace toggles above
 
-    # Determine pacing parameters
-    if pace_label == "Financial Aid Eligible":
-        half_time = False
-        financial_aid_pacing = True
-    else:
-        half_time = PACE_LABEL_TO_HALF_TIME.get(pace_label, False)
-        financial_aid_pacing = False
-
-    # Build the payload
+    # Build the payload — finaid is passed through to the planner
     payload = {
         "program_code": program_code,
         "start_term_code": start_term_code,
         "half_time": half_time,
-        "financial_aid_pacing": financial_aid_pacing,
+        "finaid": finaid,
         "certs": cert_codes,
         "max_terms": max_terms,
         "num_plans": num_plans,
-        "include_summer": include_summer,  # whether to schedule courses in Summer terms
-        "break_terms": break_terms,            # semesters the student will skip
+        "include_summer": include_summer,
+        "break_terms": break_terms,
     }
 
     try:
@@ -689,11 +722,11 @@ elif st.session_state.get("generate_clicked", False) and not st.session_state.ge
                 all_plans = rows["plans"]
             else:
                 # Single plan or already-extracted rows
-                all_plans = [{"variation": 1, "rows": rows if isinstance(rows, list) else rows.get("rows", [])}]
+                all_plans = [{"variation": 1, "rows": rows if isinstance(rows, list) else rows.get("rows", []), "finaid_warnings": []}]
 
-            # Mark generation complete and plans loaded
-            st.session_state["generate_clicked"] = False
-            st.session_state["plans_loaded"] = True
+            # FIX 3: Mark generation complete BEFORE storing plans in session state.
+            # This is the critical flag that prevents re-generation on navigation reruns.
+            st.session_state["plan_generated"] = True
 
             # Store plans in session state
             st.session_state["all_plans"] = all_plans
@@ -706,6 +739,7 @@ elif st.session_state.get("generate_clicked", False) and not st.session_state.ge
                 "max_terms": max_terms,
                 "include_summer": include_summer,
                 "break_terms": break_terms,
+                "finaid": finaid,
             }
 
     except Exception as e:
@@ -777,6 +811,7 @@ if "all_plans" in st.session_state and st.session_state["all_plans"]:
         })
 
     if _break_rows:
+        _break_df = pd.DataFrame(_break_rows)
         _all_rows = current_rows + _break_rows
         # Re-sort by term order using the START_TERMS list as reference
         _term_order = {t: i for i, t in enumerate(START_TERMS)}
@@ -824,6 +859,35 @@ if "all_plans" in st.session_state and st.session_state["all_plans"]:
                 unsafe_allow_html=True,
             )
 
+    # Financial aid warnings — shown only when the finaid toggle was on
+    # and the current plan has terms that fall below the minimum credit thresholds.
+    if meta.get("finaid"):
+        finaid_warnings = current_plan.get("finaid_warnings", [])
+        if finaid_warnings:
+            warning_lines = "<br>".join(f"⚠️ {w}" for w in finaid_warnings)
+            st.markdown(
+                f"""
+                <div class="finaid-warning-box">
+                    <strong>Financial Aid Eligibility Warning</strong><br>
+                    The following terms may not meet the minimum credit hours required for financial aid eligibility.
+                    Consider adjusting the plan or speaking with a financial aid advisor.<br><br>
+                    {warning_lines}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                """
+                <div class="finaid-success-box">
+                    ✅ <strong>Financial Aid Eligible</strong> &mdash;
+                    All terms meet the minimum credit requirements
+                    (5+ SCH in Fall/Spring, 3+ SCH in Summer).
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
 st.markdown(
     """
     <div class="custom-caption">
@@ -838,9 +902,8 @@ st.markdown(
 # The PDF includes the plan header, a term-by-term course table,
 # and a totals row with total credits and tuition estimate.
 
-
 def _format_term_label(term_code: str) -> str:
-    """Convert 'SP26' → 'Spring 2026', 'FA27' → 'Fall 2027' etc."""
+    """Convert 'SP26' -> 'Spring 2026', 'FA27' -> 'Fall 2027' etc."""
     if not term_code or len(term_code) < 4:
         return term_code
     season_code = term_code[:2]
@@ -849,7 +912,6 @@ def _format_term_label(term_code: str) -> str:
     season = season_map.get(season_code, season_code)
     year = 2000 + int(year_code)
     return f"{season} {year}"
-
 
 def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     df_local = plan_df.copy()
@@ -928,9 +990,6 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
             x0, y0 = pdf.get_x(), pdf.get_y()
 
             title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
-            # How many lines the title will need
-            title_lines = pdf.multi_cell(col_title, line_height, title, split_only=True)
-            # title_lines = pdf.multi_cell(col_title, line_height, title, dry_run=True, output="LINES")
             row_height = line_height * len(title_lines)
 
             pdf.set_xy(x0, y0)
@@ -958,12 +1017,9 @@ def make_pdf(plan_df: pd.DataFrame, header_text: str) -> bytes:
     pdf.ln()
 
     raw = pdf.output()
-    raw = pdf.output(dest="S")
-    # raw = pdf.output()
     if isinstance(raw, (bytes, bytearray)):
         return bytes(raw)
     return raw.encode("latin1")
-
 
 if df is not None:
     meta = st.session_state.get("plan_meta", {})
@@ -977,13 +1033,14 @@ if df is not None:
 
     pace_for_pdf = (
         pace_label_pdf
-        .replace("≤", "<=")
-        .replace("–", "-")
+        .replace("\u2264", "<=")
+        .replace("\u2013", "-")
     )
 
     plan_label = f" (Version {plan_index + 1} of {total_plans})" if total_plans > 1 else ""
     breaks_pdf = meta.get("break_terms", [])
     breaks_label = f"\nBreaks: {', '.join(breaks_pdf)}" if breaks_pdf else ""
+    finaid_label = "\nFinancial Aid Eligible pace: Yes" if meta.get("finaid") else ""
 
     header_txt = (
         f"Program: {program_label_pdf}{plan_label}\n"
@@ -992,6 +1049,7 @@ if df is not None:
         f"Certificates: {', '.join(cert_codes_pdf) if cert_codes_pdf else 'None'}\n"
         f"Max terms: {max_terms_pdf}"
         f"{breaks_label}"
+        f"{finaid_label}"
     )
 
     # Filter out break rows before generating PDF (break rows have 0 credits)

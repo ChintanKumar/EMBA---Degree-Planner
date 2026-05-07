@@ -9,11 +9,9 @@ import pandas as pd
 PROJECT_ID = os.environ.get("GOOGLE_CLOUD_PROJECT", "obcc-degree-planner-489404")
 DATASET = "obcc-degree-planner-489404.degree_planner_config_data"
 
-
 def get_bq_client() -> bigquery.Client:
     """Create a BigQuery client. Called inside functions so imports don't crash in Cloud Run."""
     return bigquery.Client(project=PROJECT_ID)
-
 
 PART_OF_TERM_LABELS = {
     "1st8wk": "1st 8 weeks",
@@ -30,11 +28,28 @@ CERT_ALIAS_MAP = {
     "COACH": "COACH", "Coaching": "COACH",
 }
 
+# Coaching courses must be scheduled in this exact order.
+# Each is a Full16wk course offered every Fall, Spring, and Summer.
+# Only one Coaching course may be scheduled per term.
+COACHING_COURSE_ORDER = [
+    "OB 6350",  # Executive and Professional Coaching (no prereqs)
+    "OB 6248",  # Coaching Practice Lab 1 (needs OB 6350)
+    "OB 6351",  # Coaching in the Professional or Org Setting (needs OB 6350)
+    "OB 6249",  # Coaching Practice Lab 2 (needs OB 6248)
+    "OB 6352",  # Advanced Coaching Models and Methods (needs OB 6351 + OB 6350)
+    "OB 6253",  # Coaching Practicum (needs OB 6248 + OB 6249)
+]
+
+# Financial aid minimum credit hours per term season
+FINAID_MIN_CREDITS = {
+    "SP": 5,
+    "FA": 5,
+    "SU": 3,
+}
 
 def normalize_certs(certs: List[str]) -> set:
     """Normalize certificate names to canonical short codes."""
     return {CERT_ALIAS_MAP.get(c, c) for c in certs or []}
-
 
 def get_program_courses(program_code: str, certs: List[str]) -> pd.DataFrame:
     """
@@ -129,7 +144,6 @@ def get_program_courses(program_code: str, certs: List[str]) -> pd.DataFrame:
     df = df.sort_values(["CorePriority", "OrderRank", "CourseNumber"], ascending=[True, True, True])
     return df
 
-
 def get_prereqs(program_code: str) -> pd.DataFrame:
     """
     Fetches prerequisite relationships for the given program.
@@ -153,7 +167,6 @@ def get_prereqs(program_code: str) -> pd.DataFrame:
     )
     return job.to_dataframe()
 
-
 def get_offerings(program_code: str) -> pd.DataFrame:
     """
     Fetches term/session offerings for each course.
@@ -172,12 +185,11 @@ def get_offerings(program_code: str) -> pd.DataFrame:
     if program_code == "MSLOD":
         extra_rows = pd.DataFrame([
             {"CourseOfferingID": 112, "CourseID": 8,  "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "TermSeason": "Fall", "PartOfTermCode": "2nd8wk", "SessionLabel": "2nd 8 weeks", "CreditHours": None, "PrimaryFacultyID": 24, "Format": "Online"},
-            {"CourseOfferingID": 113, "CourseID": 21, "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "TermSeason": "Fall", "PartOfTermCode": "1st8wk", "SessionLabel": "1st 8 weeks", "CreditHours": None, "PrimaryFacultyID": 20, "Format": "Online"},
+            {"CourseOfferingID": 113, "CourseID": 21, "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "PartOfTermCode": "1st8wk", "SessionLabel": "1st 8 weeks", "CreditHours": None, "PrimaryFacultyID": 20, "Format": "Online"},
             {"CourseOfferingID": 114, "CourseID": 22, "ProgramID": 2, "ProgramCode": "MSLOD", "TermCode": "FA", "PartOfTermCode": "2nd8wk", "SessionLabel": "2nd 8 weeks", "CreditHours": None, "PrimaryFacultyID": 21, "Format": "Online"},
         ])
         df = pd.concat([df, extra_rows], ignore_index=True)
     return df
-
 
 def get_term_preferences(program_code: str) -> pd.DataFrame:
     """
@@ -192,7 +204,6 @@ def get_term_preferences(program_code: str) -> pd.DataFrame:
         ])
     )
     return job.to_dataframe()
-
 
 def generate_term_sequence(start_term_code: str, max_terms: int) -> List[str]:
     """
@@ -214,14 +225,12 @@ def generate_term_sequence(start_term_code: str, max_terms: int) -> List[str]:
             year += 1
     return seq
 
-
 def compact_plan_terms(
     plan_terms: List[Dict[str, Any]],
     max_courses_per_term: int,
     offerings: pd.DataFrame,
     prereqs: pd.DataFrame,
     deferred_ids: Set[int] = None,
-    min_terms: int = 0,
 ) -> List[Dict[str, Any]]:
     """
     Moves courses earlier in the plan to fill gaps (like a defragmenter).
@@ -229,7 +238,6 @@ def compact_plan_terms(
     Runs repeatedly until no more moves are possible.
     Deferred courses (deferred_ids) are never pulled forward — this preserves
     the term-shift variation so compaction doesn't undo it.
-    min_terms: never compact below this many non-empty terms (respects max_terms setting).
     """
     if deferred_ids is None:
         deferred_ids = set()
@@ -276,11 +284,6 @@ def compact_plan_terms(
                             continue
                         if not can_place(cid, i):
                             continue
-                        # Don't move if it would empty term j and drop below min_terms
-                        if min_terms > 0 and len(plan_terms[j]["courses"]) == 1:
-                            non_empty = sum(1 for t in plan_terms if t["courses"])
-                            if non_empty <= min_terms:
-                                continue
                         plan_terms[j]["courses"].remove(c)
                         plan_terms[j]["total_credits"] -= c["credits"]
                         plan_terms[i]["courses"].append(c)
@@ -295,15 +298,10 @@ def compact_plan_terms(
                     break
 
         while plan_terms and not plan_terms[-1]["courses"]:
-            # Don't compact below min_terms non-empty terms
-            non_empty = sum(1 for t in plan_terms if t["courses"])
-            if non_empty <= min_terms:
-                break
             plan_terms.pop()
             changed = True
 
     return plan_terms
-
 
 def _build_deferred_set(
     courses: pd.DataFrame,
@@ -379,6 +377,29 @@ def _build_deferred_set(
         second_half = eligible[n:n*2]
         return set(second_half) if second_half else set(eligible[:n])
 
+def check_finaid_eligibility(plan: Dict[str, Any]) -> List[str]:
+    """
+    Checks each term in the plan against financial aid minimum credit requirements.
+    Returns a list of warning strings for any term that falls below minimums:
+      - Fall/Spring: at least 5 credit hours
+      - Summer: at least 3 credit hours
+    Break terms are excluded from the check.
+    """
+    warnings = []
+    for term in plan.get("terms", []):
+        if term.get("is_break"):
+            continue
+        season = term["term_code"][:2]
+        min_credits = FINAID_MIN_CREDITS.get(season, 5)
+        actual = term["total_credits"]
+        if actual < min_credits:
+            season_label = {"SP": "Spring", "SU": "Summer", "FA": "Fall"}.get(season, season)
+            year = 2000 + int(term["term_code"][2:])
+            warnings.append(
+                f"{season_label} {year} ({term['term_code']}): "
+                f"{actual} credit hours scheduled, but financial aid requires at least {min_credits}."
+            )
+    return warnings
 
 def run_planner(
     program_code: str,
@@ -387,7 +408,7 @@ def run_planner(
     max_terms: int = 20,
     target_credits: int = 36,
     half_time: bool = False,
-    fin_aid: bool = False,
+    finaid: bool = False,
     variation: int = 0,
     include_summer: bool = True,
     break_terms: List[str] = None,
@@ -399,18 +420,29 @@ def run_planner(
     Phase 2 (compaction): Pulls courses forward after each term.
     Phase 3 (post-processing): Fills remaining gaps.
 
+    Pacing modes:
+      - Default (half_time=False, finaid=False): schedules up to dynamic_max per term.
+      - Half-time (half_time=True): caps at 1 course per term.
+      - Financial Aid (finaid=True): enforces a minimum credit floor per term
+        (5 SCH for Fall/Spring, 3 SCH for Summer) to maintain aid eligibility
+        in every term of the plan. half_time takes precedence if both are True.
+
+    Coaching concentration (when "COACH" in certs):
+      - Coaching courses are scheduled in the fixed COACHING_COURSE_ORDER sequence.
+      - Each Coaching course is assigned the Full16wk slot.
+      - Only one Coaching course is allowed per term.
+      - Non-Coaching courses in the same term still use 8-week slots as normal,
+        allowing up to one additional 8-week course alongside a Coaching course.
+
     Variation via term-shifting:
       For variation > 0, a seeded-random subset of eligible multi-season
       non-cert courses are blocked from their FIRST eligible term and placed
       in their next eligible term instead.
-
-      The block is enforced at the TERM level (not per get_ordered_courses call)
-      so the course cannot sneak back in during the while-scheduled inner loop
-      within the same term. Post-processing guarantees all credits are still met.
     """
     import math
 
     norm_certs = normalize_certs(certs)
+    want_coaching = "COACH" in norm_certs
 
     if program_code == "HOL-EMBA":
         baseline = 7
@@ -445,36 +477,50 @@ def run_planner(
 
     total_courses = len(courses)
 
-    # initial_max: max courses per SP/FA term in the main scheduling loop.
-    # Keeps sparse programs (few courses, many terms) from front-loading early terms.
-    # Post-processing and compaction fill any remaining gaps afterward.
-    #   half_time: 1 course/term
-    #   fin_aid:   2 courses/term (6 SCH >= 5 SCH financial aid minimum)
-    #   sparse:    2 courses/term when total_courses <= baseline * 2 + 2
-    #              (ensures courses spread across all baseline terms)
-    #   normal:    3 courses/term (inner loop enforces 3×8wk or 1×Full16wk+1×8wk)
-    #   HOL-EMBA:  2 courses/term (compaction fills to 3)
     if half_time:
         dynamic_max = 1
-    elif fin_aid:
-        dynamic_max = 2
-    elif program_code == "HOL-EMBA":
-        dynamic_max = 2
-    elif total_courses <= baseline * 2 + 2:
-        # Sparse program: cap at 2/term so courses spread across all terms
-        # post-processing will fill the third slot where credits allow
-        dynamic_max = 2
-    else:
+    elif finaid:
+        # Financial aid pace: credit cap per term is enforced by get_max_credits().
+        # dynamic_max is set high so course-count limits never interfere —
+        # only the credit cap matters.
         dynamic_max = 3
+    elif max_terms <= baseline:
+        if program_code == "HOL-EMBA":
+            dynamic_max = 2
+        else:
+            dynamic_max = 3
+    else:
+        sp_fa_terms = sum(1 for t in term_seq_main if not t.startswith("SU"))
+        su_terms = sum(1 for t in term_seq_main if t.startswith("SU")) if include_summer else 0
+        su_capacity = su_terms * 2
+        sp_fa_courses_needed = max(0, total_courses - su_capacity)
+        dynamic_max = math.ceil(sp_fa_courses_needed / sp_fa_terms) if sp_fa_terms > 0 else 3
+        dynamic_max = max(1, min(3, dynamic_max))
+
+    # Financial aid credit caps per term season.
+    # When finaid=True these are used as the maximum credits per term,
+    # not just a floor for warnings.
+    FINAID_MAX_CREDITS_PER_TERM = {"SP": 5, "FA": 5, "SU": 3}
 
     def get_max_courses(term_code: str) -> int:
         if half_time:
             return 1
+        if finaid:
+            # For finaid, course count is not the limiting factor — credits are.
+            # Return a high number so only get_max_credits() acts as the cap.
+            return 3
         if term_code[:2] == "SU":
-            # Financial aid requires at least 1 course (3 SCH) in Summer
-            # Cap at 1 for fin_aid to keep summer terms light but eligible
-            return 1 if fin_aid else 2
+            return 2
         return dynamic_max
+
+    def get_max_credits(term_code: str) -> int:
+        """Returns the maximum credits allowed in a term."""
+        season = term_code[:2]
+        if finaid:
+            return FINAID_MAX_CREDITS_PER_TERM.get(season, 5)
+        if season == "SU":
+            return 6
+        return 999  # No credit cap for non-finaid, non-Summer terms
 
     term_pref_map = (
         term_prefs_df
@@ -483,13 +529,19 @@ def run_planner(
         .to_dict()
     )
 
+    # Build a lookup: CourseNumber -> CourseID for Coaching ordering
+    coaching_course_ids_ordered: List[int] = []
+    if want_coaching:
+        for cn in COACHING_COURSE_ORDER:
+            match = courses.loc[courses["CourseNumber"] == cn, "CourseID"]
+            if not match.empty:
+                coaching_course_ids_ordered.append(int(match.iloc[0]))
+
     # Build the deferred set for this variation.
-    # deferred_ids: courses to skip on their first eligible term.
-    # deferred_released: courses that have already been skipped once and
-    #   are now free to schedule normally.
-    # Both sets live at the run_planner scope so they persist correctly
-    # across all terms and all inner-loop iterations.
+    # Coaching courses are never deferred — their order is fixed.
     deferred_ids: Set[int] = _build_deferred_set(courses, offerings, variation)
+    if want_coaching:
+        deferred_ids -= set(coaching_course_ids_ordered)
     deferred_released: Set[int] = set()
 
     start_year = int(start_term_code[2:])
@@ -513,25 +565,20 @@ def run_planner(
         term_courses: List[Dict[str, Any]] = []
         term_credits = 0
         term_course_count = 0
-        used_8wk_slots: Dict[str, int] = {}  # slot -> count of courses placed (max 2 per slot)
+        used_8wk_slots: Set[str] = set()
         has_full16wk = False
+        coaching_scheduled_this_term = False  # Only one Coaching course per term
 
-        # Courses that are deferred but not yet released are blocked for
-        # this entire term. We release them here so they are available
-        # from the NEXT term onward. This happens once per term, before
-        # the inner scheduling loop, so get_ordered_courses cannot
-        # accidentally schedule them within the same term they are deferred.
+        # Release deferred courses that are first eligible this term.
+        # They become schedulable from NEXT term onward.
         newly_released: Set[int] = set()
         for cid in deferred_ids:
             if cid not in deferred_released and cid not in taken:
-                # Check if this course is eligible this term (offered + prereqs met)
                 offered = offerings[(offerings["CourseID"] == cid) & (offerings["TermCode"] == season)]
                 if not offered.empty:
                     needed = prereqs.loc[prereqs["CourseID"] == cid, "PrerequisiteCourseID"].tolist()
                     if set(needed).issubset(taken):
-                        # Course is eligible this term — defer it (block this term, release next)
                         newly_released.add(cid)
-        # Add to released AFTER the loop so all deferred courses are blocked this term
         deferred_released.update(newly_released)
 
         def get_available(df, _season=season, _year=year):
@@ -540,8 +587,6 @@ def run_planner(
                 cid = int(row["CourseID"])
                 if cid in taken:
                     continue
-                # Block deferred courses that were just released this term —
-                # they become available next term
                 if cid in newly_released:
                     continue
                 prefs = term_pref_map.get(cid)
@@ -562,17 +607,31 @@ def run_planner(
 
         def get_ordered_courses(_season=season):
             available = get_available(courses)
-            multi_cert = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 0], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
-            excl_cert  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 0], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
-            excl_core  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 1], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
-            multi_core = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 1], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
-            excl_elec  = sorted([r for r in available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 2], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
-            multi_elec = sorted([r for r in available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 2], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            available_ids = {int(r["CourseID"]) for r in available}
+
+            # Coaching courses: insert the next unscheduled one in sequence at the front.
+            # This enforces COACHING_COURSE_ORDER regardless of CorePriority sorting.
+            coaching_front = []
+            if want_coaching:
+                for cid in coaching_course_ids_ordered:
+                    if cid in available_ids:
+                        row = courses.loc[courses["CourseID"] == cid].iloc[0]
+                        coaching_front.append(row)
+                        break  # Only the next Coaching course in sequence per pass
+
+            non_coaching_available = [r for r in available if int(r["CourseID"]) not in {int(c["CourseID"]) for c in coaching_front}]
+
+            multi_cert = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 0], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            excl_cert  = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 0], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            excl_core  = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 1], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            multi_core = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 1], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            excl_elec  = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) == 1 and r["CorePriority"] == 2], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
+            multi_elec = sorted([r for r in non_coaching_available if count_seasons(int(r["CourseID"])) > 1  and r["CorePriority"] == 2], key=lambda r: (r["OrderRank"], r["CourseNumber"]))
             if variation > 0:
                 rng = random.Random(variation + 1)
                 rng.shuffle(excl_elec)
                 rng.shuffle(multi_elec)
-            return multi_cert + excl_cert + excl_core + multi_core + excl_elec + multi_elec
+            return coaching_front + multi_cert + excl_cert + excl_core + multi_core + excl_elec + multi_elec
 
         scheduled_this_term = True
         while scheduled_this_term:
@@ -584,48 +643,35 @@ def run_planner(
 
                 season = full_term[:2]
                 term_max = get_max_courses(full_term)
+                is_coaching_course = want_coaching and int(row["CourseID"]) in set(coaching_course_ids_ordered)
+
+                # Only one Coaching course allowed per term
+                if is_coaching_course and coaching_scheduled_this_term:
+                    continue
 
                 if season == "SU":
                     credits = int(row["DefaultCreditHours"])
                     if term_course_count >= term_max:
                         break
-                    if term_credits + credits > 6:
+                    if term_credits + credits > get_max_credits(full_term):
                         continue
                 else:
-                    if has_full16wk:
-                        # 1×Full16wk + max 1×8wk per term
-                        if term_course_count >= 2:
-                            break
+                    credits = int(row["DefaultCreditHours"])
+                    # Enforce finaid credit cap for SP/FA terms — break the loop
+                    # entirely since no further course can fit under the cap.
+                    if finaid and term_credits + credits > get_max_credits(full_term):
+                        break
+                    # Coaching courses occupy Full16wk; check if slot is already taken
+                    if is_coaching_course:
+                        if has_full16wk:
+                            continue  # Full16wk already occupied
                     else:
-                        total_8wk = sum(used_8wk_slots.values())
-                        # Normal preferred max: 3×8wk per term
-                        # Exception: 4×8wk (2 per slot) only when needed to fit
-                        # within max_terms (e.g. SHR needing 6 terms)
-                        courses_remaining = sum(1 for _, r in courses.iterrows()
-                                                if int(r["CourseID"]) not in taken)
-                        try:
-                            remaining_terms = term_seq_main[term_seq_main.index(full_term):]
-                        except ValueError:
-                            remaining_terms = []
-                        sp_fa_remaining = sum(1 for t in remaining_terms
-                                              if not t.startswith("SU")
-                                              and t not in break_terms_set)
-                        # Dense packing (4×8wk) only when MS LOD can't fit at
-                        # normal pace within remaining terms.
-                        # Sparse programs (dynamic_max=2) stay at 2 in main loop;
-                        # post-processing fills the third slot.
-                        need_dense = (
-                            program_code != "HOL-EMBA"
-                            and dynamic_max >= 3
-                            and sp_fa_remaining > 0
-                            and courses_remaining > sp_fa_remaining * 3
-                        )
-                        hard_max = 4 if need_dense else dynamic_max
-                        if total_8wk >= hard_max:
-                            break
-                        # Also enforce per-slot cap of 2
-                        if all(used_8wk_slots.get(s, 0) >= 2 for s in ("1st8wk", "2nd8wk")):
-                            break
+                        if has_full16wk:
+                            if term_course_count >= 2:
+                                break
+                        else:
+                            if len(used_8wk_slots) >= term_max:
+                                break
 
                 cid = int(row["CourseID"])
                 if cid in taken:
@@ -648,10 +694,14 @@ def run_planner(
                 if offered.empty:
                     continue
 
+                # Slot assignment
                 chosen_slot = None
                 slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
 
-                if program_code == "HOL-EMBA" and course_number in ("FIN 6301", "OPRE 6301"):
+                if is_coaching_course:
+                    # Coaching courses are always Full16wk
+                    chosen_slot = "Full16wk"
+                elif program_code == "HOL-EMBA" and course_number in ("FIN 6301", "OPRE 6301"):
                     if "Full16wk" in slots:
                         chosen_slot = "Full16wk"
                     else:
@@ -660,20 +710,15 @@ def run_planner(
                     if season in ("SP", "FA"):
                         has_real_8wk = any(s in ("1st8wk", "2nd8wk") for s in slots)
                         if has_real_8wk:
-                            # Prefer the slot with fewer courses so load spreads
-                            # evenly (1st+2nd+1st gives 3×8wk before doubling a slot)
-                            avail = [s for s in slots
-                                     if s in ("1st8wk", "2nd8wk")
-                                     and used_8wk_slots.get(s, 0) < 2]
-                            if avail:
-                                chosen_slot = min(avail,
-                                                  key=lambda s: used_8wk_slots.get(s, 0))
-                        else:
-                            # Course has no explicit slot — assign to least-used slot
-                            for slot in ("1st8wk", "2nd8wk"):
-                                if used_8wk_slots.get(slot, 0) < 2:
+                            for slot in slots:
+                                if slot in ("1st8wk", "2nd8wk") and slot not in used_8wk_slots:
                                     chosen_slot = slot
                                     break
+                        else:
+                            if "1st8wk" not in used_8wk_slots:
+                                chosen_slot = "1st8wk"
+                            elif "2nd8wk" not in used_8wk_slots:
+                                chosen_slot = "2nd8wk"
                     else:
                         for slot in slots:
                             chosen_slot = slot
@@ -682,11 +727,15 @@ def run_planner(
                 if chosen_slot is None:
                     continue
 
+                # Update slot tracking
                 if season in ("SP", "FA"):
                     if chosen_slot == "Full16wk":
                         has_full16wk = True
                     elif chosen_slot in ("1st8wk", "2nd8wk"):
-                        used_8wk_slots[chosen_slot] = used_8wk_slots.get(chosen_slot, 0) + 1
+                        used_8wk_slots.add(chosen_slot)
+
+                if is_coaching_course:
+                    coaching_scheduled_this_term = True
 
                 term_courses.append({
                     "course_id": cid,
@@ -714,17 +763,16 @@ def run_planner(
         if total_credits_so_far >= target_credits:
             break
 
-        if full_term[:2] == "SU":
-            compact_max = 2
-        elif program_code == "HOL-EMBA":
-            compact_max = 3
-        elif fin_aid:
-            compact_max = 2
-        else:
-            # MS LOD normal: compact up to 3 courses per term (preferred max)
-            compact_max = 3
-        plan_terms = compact_plan_terms(plan_terms, compact_max, offerings, prereqs, deferred_ids, min_terms=baseline)
-
+        if not half_time:
+            if finaid:
+                compact_max = 3  # Credit cap handles compaction limits, not course count
+            elif full_term[:2] == "SU":
+                compact_max = 2
+            elif program_code == "HOL-EMBA":
+                compact_max = 3
+            else:
+                compact_max = dynamic_max
+            plan_terms = compact_plan_terms(plan_terms, compact_max, offerings, prereqs, deferred_ids)
 
     # Post-processing: fill remaining credit gaps
     if total_credits_so_far < target_credits:
@@ -749,7 +797,7 @@ def run_planner(
                 needed = prereqs.loc[prereqs["CourseID"] == cid, "PrerequisiteCourseID"].tolist()
                 if not set(needed).issubset(taken):
                     continue
-                if season == "SU" and (len(term["courses"]) >= 2 or term["total_credits"] + credits > 6):
+                if season == "SU" and (len(term["courses"]) >= 2 or term["total_credits"] + credits > get_max_credits(term["term_code"])):
                     continue
                 slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
                 used = {c["part_of_term"] for c in term["courses"]}
@@ -797,7 +845,7 @@ def run_planner(
                     needed = prereqs.loc[prereqs["CourseID"] == cid, "PrerequisiteCourseID"].tolist()
                     if not set(needed).issubset(taken):
                         continue
-                    if season == "SU" and (len(new_courses) >= 2 or new_credits + credits > 6):
+                    if season == "SU" and (len(new_courses) >= 2 or new_credits + credits > get_max_credits(full_term)):
                         continue
                     slots = [str(s) for s in offered["PartOfTermCode"].dropna().unique()]
                     used = {c["part_of_term"] for c in new_courses}
@@ -829,19 +877,24 @@ def run_planner(
             })
     plan_terms.sort(key=lambda t: term_seq_post.index(t["term_code"]) if t["term_code"] in term_seq_post else 999)
 
+    # Financial aid eligibility check — compute warnings but don't alter scheduling.
+    # Warnings are stored on the plan dict and surfaced by the UI.
+    finaid_warnings: List[str] = []
+    if finaid:
+        finaid_warnings = check_finaid_eligibility({"terms": plan_terms})
 
     return {
         "program_code": program_code,
         "certificates": certs,
         "start_term_code": start_term_code,
         "half_time": half_time,
-        "fin_aid": fin_aid,
+        "finaid": finaid,
+        "finaid_warnings": finaid_warnings,
         "include_summer": include_summer,
         "break_terms": list(break_terms_set),
         "terms": plan_terms,
         "total_credits": total_credits_so_far,
     }
-
 
 def enrich_plan_with_tuition(plan: Dict[str, Any], tuition_per_credit: int = TUITION_PER_CREDIT) -> Dict[str, Any]:
     """Adds tuition estimates to each course and computes term and plan totals."""
@@ -858,7 +911,6 @@ def enrich_plan_with_tuition(plan: Dict[str, Any], tuition_per_credit: int = TUI
     plan["total_tuition"] = total
     return plan
 
-
 def plan_to_table_rows(plan: Dict[str, Any], tuition_per_credit: int = TUITION_PER_CREDIT) -> List[Dict[str, Any]]:
     """Flattens nested plan into a flat list of rows for the Streamlit table."""
     rows: List[Dict[str, Any]] = []
@@ -874,7 +926,6 @@ def plan_to_table_rows(plan: Dict[str, Any], tuition_per_credit: int = TUITION_P
                 "tuition": credits * tuition_per_credit,
             })
     return rows
-
 
 def summarize_plan(plan: Dict[str, Any], label: str = "") -> None:
     """Prints a human-readable plan summary to the terminal (for debugging)."""
